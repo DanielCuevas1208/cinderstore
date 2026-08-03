@@ -4,7 +4,8 @@ module Cinderstore
   # A self-contained walkthrough of the store.
   #
   # The demo loads a small product catalog, writes it, scans a range,
-  # flushes, compacts, and verifies recovery. Its output is deterministic.
+  # flushes, compacts, verifies recovery, and shows checksum-free fast
+  # mode. Its output is deterministic.
   class Demo
     def self.run(db_path : String? = nil, fixture : String? = nil) : Int32
       new(db_path, fixture).run
@@ -86,12 +87,12 @@ module Cinderstore
       puts "   live SKU-0001    => #{db.get("SKU-0001").inspect}"
       puts "   snapshot SKU-0001 => #{snap.get("SKU-0001").inspect}"
       puts "   snapshot iterator SKU-0010 to SKU-0016"
-      rows = [] of String
+      iter_keys = [] of String
       iter = snap.iter("SKU-0010")
       while (entry = iter.next?) && entry.key < "SKU-0016"
-        rows << entry.key
+        iter_keys << entry.key
       end
-      puts "   #{rows.join(", ")}"
+      puts "   #{iter_keys.join(", ")}"
       snap.release
       puts ""
 
@@ -102,6 +103,28 @@ module Cinderstore
       count = reopened.scan.size
       puts "   rows after restart: #{count}"
       reopened.close
+      puts ""
+
+      puts "9. Run the store in checksum-free fast mode"
+      fast_path = File.join(Dir.tempdir, "cinderstore-demo-fast")
+      FileUtils.rm_rf(fast_path) if File.exists?(fast_path)
+      fast_config = DB::Config.new
+      fast_config.sync_writes = false
+      fast_config.compact_on_flush = false
+      fast_config.checksums = false
+      fast = DB.new(fast_path, fast_config)
+      rows.first(5).each do |sku, name, price, stock|
+        fast.put(sku, %({"name":"#{name}","price":#{price},"stock":#{stock}}))
+      end
+      fast.flush
+      puts "   fast writes: #{fast.stats.entries} entries in #{fast.stats.tables} table"
+      fast.close
+
+      fast_reopened = DB.new(fast_path, fast_config)
+      puts "   fast recovery: #{fast_reopened.scan.size} rows after restart"
+      puts "   fast get SKU-0001 => #{fast_reopened.get("SKU-0001")}"
+      fast_reopened.close
+      FileUtils.rm_rf(fast_path)
       puts ""
       puts "Demo complete."
       0

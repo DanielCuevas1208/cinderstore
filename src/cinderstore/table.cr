@@ -34,6 +34,10 @@ module Cinderstore
   # file offset and total length. The bloom filter lets a reader skip a
   # table that cannot contain a key. The footer stores offsets and a CRC32
   # over the entire footer.
+  #
+  # Checksums are optional. When they are disabled, every checksum field
+  # is written as zero and never computed. A stored zero is treated as
+  # "no checksum", so a table written in one mode reads in the other.
   class SstableWriter
     MAGIC       = 0x43494E4445525F31_u64
     VERSION     =                  1_u32
@@ -43,6 +47,7 @@ module Cinderstore
     @id : Int64
     @block_size : Int32
     @fpp : Float64
+    @checksums : Bool
     @pending : IO::Memory
     @pending_keys : Array(String)
     @keys : Array(String)
@@ -51,7 +56,7 @@ module Cinderstore
     @first : String?
     @last : String?
 
-    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01)
+    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01, @checksums : Bool = true)
       @io = io
       @pending = IO::Memory.new
       @pending_keys = [] of String
@@ -103,7 +108,8 @@ module Cinderstore
       footer.write_bytes(VERSION, IO::ByteFormat::LittleEndian)
       footer_bytes = footer.to_slice
       @io.write(footer_bytes)
-      @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
+      footer_crc = @checksums ? Util.crc32(footer_bytes) : 0_u32
+      @io.write_bytes(footer_crc, IO::ByteFormat::LittleEndian)
       @io.flush
 
       TableMeta.new(@id, @first.not_nil!, @last.not_nil!, @count)
@@ -114,7 +120,8 @@ module Cinderstore
       offset = @io.pos
       Util.write_varint(@io, data.size.to_u64)
       @io.write(data)
-      @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
+      block_crc = @checksums ? Util.crc32(data) : 0_u32
+      @io.write_bytes(block_crc, IO::ByteFormat::LittleEndian)
       total = Util.varint_len(data.size.to_u64) + data.size + 4
       @index << BlockIndexEntry.new(@pending_keys.first, offset.to_u64, total.to_u64)
       @pending = IO::Memory.new
@@ -132,12 +139,13 @@ module Cinderstore
     @index : Array(BlockIndexEntry)
     @bloom : BloomFilter?
     @closed : Bool
+    @checksums : Bool
     @index_offset : UInt64
     @index_length : UInt64
     @bloom_offset : UInt64
     @bloom_length : UInt64
 
-    def initialize(@path : String, @file_id : Int64, @cache : BlockCache? = nil)
+    def initialize(@path : String, @file_id : Int64, @cache : BlockCache? = nil, @checksums : Bool = true)
       @file = File.open(@path, "r")
       @size = @file.size
       @index = [] of BlockIndexEntry
@@ -221,8 +229,10 @@ module Cinderstore
       data = Bytes.new(data_len)
       @file.read_fully(data)
       stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(data)
-      raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      if @checksums && stored_crc != 0_u32
+        actual_crc = Util.crc32(data)
+        raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      end
       data
     end
 
@@ -234,8 +244,10 @@ module Cinderstore
 
       crc_bytes = footer[SstableWriter::FOOTER_SIZE - 4, 4]
       stored_crc = IO::Memory.new(crc_bytes).read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(footer[0, SstableWriter::FOOTER_SIZE - 4])
-      raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      if @checksums && stored_crc != 0_u32
+        actual_crc = Util.crc32(footer[0, SstableWriter::FOOTER_SIZE - 4])
+        raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      end
 
       io = IO::Memory.new(footer)
       magic = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)

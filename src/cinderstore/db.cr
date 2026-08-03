@@ -32,6 +32,12 @@ module Cinderstore
       property l0_compact_threshold : Int32 = 4
       # Start background compaction after a flush when true.
       property compact_on_flush : Bool = true
+      # Verify and write CRC32 checksums when true.
+      #
+      # Fast mode disables checksums. It saves CPU and speeds up writes and
+      # reads. Corrupted data is then not detected. Files from both modes
+      # share one on-disk format and interoperate.
+      property checksums : Bool = true
     end
 
     # A snapshot of database counters for reporting.
@@ -93,15 +99,16 @@ module Cinderstore
       @reader : SstableReader?
       @refs : Int32 = 1
       @orphaned : Bool = false
+      @checksums : Bool
 
-      def initialize(@id : Int64, @first : String, @last : String, @count : Int64, @path : String)
+      def initialize(@id : Int64, @first : String, @last : String, @count : Int64, @path : String, @checksums : Bool = true)
       end
 
       # Returns the cached reader for this table.
       def reader(cache : BlockCache) : SstableReader
         r = @reader
         unless r
-          r = SstableReader.new(@path, @id, cache)
+          r = SstableReader.new(@path, @id, cache, @checksums)
           @reader = r
         end
         r
@@ -260,7 +267,7 @@ module Cinderstore
       @lock.synchronize do
         check_open
         tables = @levels.map { |level| level.dup }
-        Snapshot.new(@seq, @mem.dup, @frozen, tables, @config.cache_blocks)
+        Snapshot.new(@seq, @mem.dup, @frozen, tables, @config.cache_blocks, @config.checksums)
       end
     end
 
@@ -335,7 +342,7 @@ module Cinderstore
     private def load_tables(manifest : Manifest) : Nil
       @levels = manifest.levels.map do |level|
         level.map do |info|
-          TableRef.new(info.id, info.first, info.last, info.count, table_path(info.id))
+          TableRef.new(info.id, info.first, info.last, info.count, table_path(info.id), @config.checksums)
         end
       end
       @levels = [[] of TableRef] if @levels.empty?
@@ -359,7 +366,7 @@ module Cinderstore
       files = Dir.children(@path).select { |name| name.ends_with?(WAL_SUFFIX) }.sort
       files.each do |name|
         full = File.join(@path, name)
-        @seq = Wal.recover(full, @mem, @seq)
+        @seq = Wal.recover(full, @mem, @seq, @config.checksums)
       end
       # The memtable now holds what the logs held. Keep the logs so that a
       # crash before the next flush does not lose data. Empty logs carry no
@@ -374,7 +381,7 @@ module Cinderstore
     private def create_active_wal : Nil
       id = @next_id
       @next_id += 1
-      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes)
+      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes, @config.checksums)
     end
 
     # ------------------------------------------------------------------
@@ -429,7 +436,7 @@ module Cinderstore
           @next_id += 1
           wal_id = @next_id
           @next_id += 1
-          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes)
+          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes, @config.checksums)
         end
       end
 
@@ -438,7 +445,7 @@ module Cinderstore
       meta = write_memtable_to_table(table_id, frozen)
 
       @lock.synchronize do
-        @levels[0] << TableRef.new(meta.id, meta.first, meta.last, meta.count, table_path(meta.id))
+        @levels[0] << TableRef.new(meta.id, meta.first, meta.last, meta.count, table_path(meta.id), @config.checksums)
         @frozen = nil
         if old = @old_wal
           old.close
@@ -459,7 +466,7 @@ module Cinderstore
       final_path = table_path(table_id)
       meta = nil
       File.open(tmp_path, "w") do |io|
-        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp)
+        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         mem.each_entry do |entry|
           writer.add(entry.key, entry.value, entry.seq, entry.alive)
         end
@@ -512,7 +519,7 @@ module Cinderstore
       outputs = merge_tables(tables.not_nil!)
 
       @lock.synchronize do
-        @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }]
+        @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id), @config.checksums) }]
         save_manifest
         tables.not_nil!.each do |ref|
           # Mark the table as gone, then drop the database reference. The
@@ -557,7 +564,7 @@ module Cinderstore
             id
           end
           io = File.open(File.join(@path, "#{Util.file_stem(current_id)}#{TMP_SUFFIX}"), "w")
-          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp)
+          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         end
         writer.not_nil!.add(entry.key, entry.value, entry.seq, true)
         written += 1

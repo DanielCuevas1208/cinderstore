@@ -14,7 +14,7 @@ module Cinderstore
     @readers = {} of DB::TableRef => SstableReader
 
     def initialize(@seq : Int64, @mem : MemTable, @frozen : MemTable?,
-                   @tables : Array(Array(DB::TableRef)), cache_blocks : Int32)
+                   @tables : Array(Array(DB::TableRef)), cache_blocks : Int32, @checksums : Bool = true)
       @block_cache = BlockCache.new(cache_blocks)
       @tables.flatten.each(&.retain)
     end
@@ -128,7 +128,7 @@ module Cinderstore
     private def reader_for(ref : DB::TableRef) : SstableReader
       reader = @readers[ref]?
       unless reader
-        reader = SstableReader.new(ref.path, ref.id, @block_cache)
+        reader = SstableReader.new(ref.path, ref.id, @block_cache, @checksums)
         @readers[ref] = reader
       end
       reader
