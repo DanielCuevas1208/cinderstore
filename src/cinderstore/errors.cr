@@ -22,4 +22,8 @@ module Cinderstore
   # Raised when a command does not follow the wire protocol.
   class ProtocolError < Error
   end
+
+  # Raised when an operation targets a released snapshot.
+  class SnapshotReleasedError < Error
+  end
 end

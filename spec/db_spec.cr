@@ -1,5 +1,14 @@
 require "./spec_helper"
 
+# A database that can simulate the transient state during a flush.
+class InFlightFlushDB < Cinderstore::DB
+  # Moves the active memtable into the frozen slot, as a flush does.
+  def force_flush_state : Nil
+    @frozen = @mem
+    @mem = Cinderstore::MemTable.new
+  end
+end
+
 def wait_until(timeout : Time::Span = 5.seconds, &block : -> Bool) : Nil
   deadline = Time.instant + timeout
   until block.call
@@ -194,6 +203,22 @@ describe Cinderstore::DB do
     Cinderstore::SpecHelpers.with_db("db-invalid") do |db, _path|
       key = "x" * (Cinderstore::DB::MAX_KEY_BYTES + 1)
       expect_raises(Cinderstore::InvalidKeyError) { db.put(key, "v") }
+    end
+  end
+
+  it "reads the newest value while a flush holds the old memtable" do
+    path = Cinderstore::SpecHelpers.tmp_db_path("db-inflight")
+    config = Cinderstore::SpecHelpers.fast_config
+    db = InFlightFlushDB.new(path, config)
+    begin
+      db.put("k", "old")
+      db.force_flush_state
+      db.put("k", "new")
+      db.get("k").should eq("new")
+      db.scan.map(&.[1]).should eq(["new"])
+    ensure
+      db.close rescue nil
+      FileUtils.rm_rf(path)
     end
   end
 

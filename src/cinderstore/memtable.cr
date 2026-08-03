@@ -80,6 +80,23 @@ module Cinderstore
       each_from("", &block)
     end
 
+    # Returns an independent copy of this table.
+    #
+    # The copy holds the same entries and the same byte estimate. It uses a
+    # fixed random seed, so its structure is deterministic. The copy never
+    # changes after creation, which makes it safe to share across fibers.
+    def dup : MemTable
+      copy = MemTable.new(Random.new(0))
+      each_entry do |entry|
+        if entry.alive
+          copy.put(entry.key, entry.value, entry.seq)
+        else
+          copy.delete(entry.key, entry.seq)
+        end
+      end
+      copy
+    end
+
     # Returns the node for the first key >= `start_key`. Used by iterators.
     def lower_bound(start_key : String) : SkipList::Node?
       @table.lower_bound(start_key)

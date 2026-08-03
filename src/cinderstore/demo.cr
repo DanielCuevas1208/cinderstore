@@ -74,9 +74,30 @@ module Cinderstore
       puts "   scan count   => #{db.scan.size}"
       puts ""
 
+      puts "7. Snapshot the store for a consistent read"
+      snap = db.snapshot
+      puts "   snapshot rows at creation: #{snap.count}"
+      db.put("SKU-0025", %({"name":"Bellows Copper","price":48.50,"stock":9}))
+      db.put("SKU-0026", %({"name":"Chimney Brush Steel","price":23.90,"stock":17}))
+      db.delete("SKU-0001")
+      db.flush
+      puts "   after 2 new writes and 1 delete, then a flush"
+      puts "   live rows: #{db.scan.size}, snapshot rows: #{snap.count}"
+      puts "   live SKU-0001    => #{db.get("SKU-0001").inspect}"
+      puts "   snapshot SKU-0001 => #{snap.get("SKU-0001").inspect}"
+      puts "   snapshot iterator SKU-0010 to SKU-0016"
+      rows = [] of String
+      iter = snap.iter("SKU-0010")
+      while (entry = iter.next?) && entry.key < "SKU-0016"
+        rows << entry.key
+      end
+      puts "   #{rows.join(", ")}"
+      snap.release
+      puts ""
+
       db.close
 
-      puts "7. Reopen the database and verify recovery"
+      puts "8. Reopen the database and verify recovery"
       reopened = DB.new(path, config)
       count = reopened.scan.size
       puts "   rows after restart: #{count}"
