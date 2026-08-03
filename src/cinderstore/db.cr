@@ -6,7 +6,8 @@ module Cinderstore
   # Writes go to a memtable and a write ahead log. When the memtable grows
   # past its limit we flush it to a sorted table. Background compaction
   # merges tables and drops stale data. Reads merge the memtable and all
-  # tables, which makes every view consistent with the write order.
+  # tables, which makes every view consistent with the write order. A
+  # snapshot returns the same view no matter what writes happen later.
   class DB
     MANIFEST_NAME     = "MANIFEST"
     WAL_SUFFIX        = ".wal"
@@ -82,6 +83,86 @@ module Cinderstore
       end
     end
 
+    # A consistent point-in-time view of the database.
+    #
+    # A snapshot captures the write sequence, the memtable contents, and
+    # the table set when it is created. Later writes, flushes, and
+    # compactions never change what a snapshot returns. The snapshot pins
+    # the table files it reads, so compaction defers deletion until the
+    # snapshot closes.
+    class Snapshot
+      getter seq : Int64
+
+      @db : DB
+      @mem : MemTable
+      @frozen : MemTable?
+      @readers : Array(SstableReader)
+      @ids : Array(Int64)
+      @closed = false
+
+      def initialize(@db : DB, @mem : MemTable, @frozen : MemTable?,
+                     @readers : Array(SstableReader), @ids : Array(Int64),
+                     @seq : Int64)
+      end
+
+      # Returns the live value for `key` at capture time, or nil.
+      def get(key : String) : String?
+        @db.validate_key(key)
+        @db.@lock.synchronize do
+          check_open
+          if entry = @frozen.try { |mem| mem.get_entry(key) }
+            return entry.alive ? entry.value : nil
+          end
+          if entry = @mem.get_entry(key)
+            return entry.alive ? entry.value : nil
+          end
+          iter = LiveIter.new(@db.merge_sources(@mem, @frozen, @readers, key, true))
+          if entry = iter.next?
+            return entry.value if entry.key == key
+          end
+          nil
+        end
+      end
+
+      # Returns live key/value pairs in key order. The range is
+      # [start_key, finish_key).
+      def scan(start_key : String = "", finish_key : String? = nil,
+               limit : Int32 = -1) : Array(Tuple(String, String))
+        @db.@lock.synchronize do
+          check_open
+          result = [] of Tuple(String, String)
+          iter = LiveIter.new(@db.merge_sources(@mem, @frozen, @readers, start_key, false))
+          while entry = iter.next?
+            break if finish_key && entry.key >= finish_key
+            result << {entry.key, entry.value}
+            break if limit >= 0 && result.size >= limit
+          end
+          result
+        end
+      end
+
+      # Yields live key/value pairs in key order. The range is
+      # [start_key, finish_key).
+      def each(start_key : String = "", finish_key : String? = nil,
+               &block : String, String ->) : Nil
+        scan(start_key, finish_key).each { |key, value| yield key, value }
+      end
+
+      # Releases the pinned table files. A closed snapshot cannot be read.
+      def close : Nil
+        @db.@lock.synchronize do
+          return if @closed
+          @closed = true
+          @readers.each(&.close)
+          @db.unpin_tables(@ids)
+        end
+      end
+
+      private def check_open : Nil
+        raise ClosedError.new("snapshot is closed") if @closed
+      end
+    end
+
     # A live reference to one sorted table file.
     class TableRef
       getter id : Int64
@@ -129,6 +210,8 @@ module Cinderstore
     @compacting = false
     @pending_table_id : Int64 = 0_i64
     @manifest : Manifest? = nil
+    @pinned : Hash(Int64, Int32)
+    @pending_deletes : Hash(Int64, String)
 
     def initialize(path : String, config : Config = Config.new)
       @path = path
@@ -136,6 +219,8 @@ module Cinderstore
       @mem = MemTable.new
       @levels = [[] of TableRef]
       @block_cache = BlockCache.new(config.cache_blocks)
+      @pinned = {} of Int64 => Int32
+      @pending_deletes = {} of Int64 => String
       open
     end
 
@@ -216,6 +301,27 @@ module Cinderstore
     def compact : Nil
       @flush_lock.synchronize do
         do_compact
+      end
+    end
+
+    # Captures a consistent point-in-time view of the store.
+    #
+    # The snapshot owns its readers and pins the table files, so a later
+    # flush or compaction never changes what it returns. Close the snapshot
+    # to release the pinned files.
+    def snapshot : Snapshot
+      @lock.synchronize do
+        check_open
+        mem_copy = MemTable.new
+        @mem.each_entry { |entry| mem_copy.put(entry.key, entry.value, entry.seq) }
+        ids = [] of Int64
+        readers = [] of SstableReader
+        @levels.flatten.each do |ref|
+          ids << ref.id
+          readers << SstableReader.new(ref.path, ref.id, @block_cache)
+        end
+        pin_tables(ids)
+        Snapshot.new(self, mem_copy, @frozen, readers, ids, @seq)
       end
     end
 
@@ -339,16 +445,23 @@ module Cinderstore
     end
 
     private def make_merge_iter(start : String, bloom_guard : Bool) : MergeIter
+      readers = @levels.flatten.map { |ref| ref.reader(@block_cache) }
+      merge_sources(@mem, @frozen, readers, start, bloom_guard)
+    end
+
+    # Builds a merge iterator over the given memtable, frozen table, and
+    # table readers. Snapshot reads reuse this so they see exactly the
+    # state the snapshot captured.
+    protected def merge_sources(mem : MemTable, frozen : MemTable?,
+                                readers : Array(SstableReader), start : String,
+                                bloom_guard : Bool) : MergeIter
       sources = [] of Store::Iter
-      if frozen = @frozen
+      if frozen
         sources << MemIter.new(frozen, start)
       end
-      sources << MemIter.new(@mem, start)
-      @levels.flatten.each do |ref|
-        reader = ref.reader(@block_cache)
-        if bloom_guard && !reader.bloom_may_contain?(start)
-          next
-        end
+      sources << MemIter.new(mem, start)
+      readers.each do |reader|
+        next if bloom_guard && !reader.bloom_may_contain?(start)
         sources << TableIter.new(reader, start)
       end
       MergeIter.new(sources)
@@ -460,8 +573,7 @@ module Cinderstore
         @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }]
         save_manifest
         tables.not_nil!.each do |ref|
-          path = ref.path
-          File.delete(path) if File.exists?(path)
+          delete_table_file(ref.id, ref.path)
         end
       end
     end
@@ -534,7 +646,7 @@ module Cinderstore
       File.join(@path, "#{Util.file_stem(id)}#{SST_SUFFIX}")
     end
 
-    private def validate_key(key : String) : Nil
+    protected def validate_key(key : String) : Nil
       raise InvalidKeyError.new("key must not be empty") if key.empty?
       raise InvalidKeyError.new("key exceeds #{MAX_KEY_BYTES} bytes") if key.bytesize > MAX_KEY_BYTES
     end
@@ -547,6 +659,43 @@ module Cinderstore
       File.size(path)
     rescue File::NotFoundError
       0_i64
+    end
+
+    # ------------------------------------------------------------------
+    # Snapshot pinning
+    # ------------------------------------------------------------------
+
+    # Increments the pin count for each table id. A pinned table file
+    # cannot be deleted by compaction.
+    private def pin_tables(ids : Array(Int64)) : Nil
+      ids.each do |id|
+        @pinned[id] = (@pinned[id]? || 0) + 1
+      end
+    end
+
+    # Decrements the pin count for each table id. When the last pin for a
+    # table is released, any deferred delete for it runs now.
+    protected def unpin_tables(ids : Array(Int64)) : Nil
+      ids.each do |id|
+        count = (@pinned[id]? || 0) - 1
+        if count <= 0
+          @pinned.delete(id)
+          if path = @pending_deletes.delete(id)
+            File.delete(path) rescue nil
+          end
+        else
+          @pinned[id] = count
+        end
+      end
+    end
+
+    # Deletes a table file, or defers the delete while a snapshot pins it.
+    private def delete_table_file(id : Int64, path : String) : Nil
+      if (@pinned[id]? || 0) > 0
+        @pending_deletes[id] = path
+      else
+        File.delete(path) if File.exists?(path)
+      end
     end
   end
 end

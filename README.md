@@ -1,7 +1,6 @@
 # Cinderstore
 
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
-<!-- Replace <owner>/<repo> with your repository path. -->
+[![CI](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml)
 
 Cinderstore is an embeddable key and value store. It is built on a log
 structured merge tree (LSM tree). It is written in Crystal and uses only the
@@ -9,9 +8,10 @@ Crystal standard library.
 
 The store keeps a write ahead log for durability. It flushes memory to sorted
 files. It merges those files during compaction. It recovers all data after a
-restart. It serves `get`, `put`, and `delete` over a local socket.
+restart. It serves `get`, `put`, and `delete` over a local socket. A snapshot
+returns the same view, even when writes continue.
 
-This is release 0.1.0. It is the first coherent release.
+This is release 0.2.0. It adds snapshot iterators and consistent reads.
 
 ## Features
 
@@ -21,6 +21,7 @@ This is release 0.1.0. It is the first coherent release.
 - Block cache for fast repeated reads
 - Background flush and compaction
 - Range scans with an iterator API
+- Consistent snapshots that ignore later writes
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
 - Zero runtime dependencies
@@ -51,11 +52,11 @@ bin/cinderstore demo
 ## Demo output
 
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
-scans, flushes, compacts, deletes, and reopens a database. The output is
+scans, flushes, compacts, and snapshots a database. The output is
 deterministic.
 
 ```text
-== Cinderstore 0.1.0 demo ==
+== Cinderstore 0.2.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -85,11 +86,19 @@ Database directory: ...\cinderstore-demo
 
 6. Verify deletes and updates after compaction
    get SKU-0003 => nil
-   get SKU-0001 => {"name":"Forge Anvil 45kg","price":175.00,"stock":14}
+   get SKU-0001 => "{\"name\":\"Forge Anvil 45kg\",\"price\":175.00,\"stock\":14}"
    scan count   => 20
 
-7. Reopen the database and verify recovery
-   rows after restart: 20
+7. Snapshot gives a consistent point-in-time view
+   snapshot rows: 20, snapshot sequence: 30
+   live rows after writes, flush, and compact: 17
+   snapshot rows: 20
+   snapshot get SKU-0005 => "{\"name\":\"Tongs Long Reach\",\"price\":29.75,\"stock\":30}"
+   live get SKU-0005      => nil
+   snapshot closed; its tables are now freed
+
+8. Reopen the database and verify recovery
+   rows after restart: 17
 
 Demo complete.
 ```
@@ -129,6 +138,34 @@ Flush and compact explicitly.
 db.flush    # Move the memtable into a table.
 db.compact  # Merge tables and drop deleted keys.
 ```
+
+## Snapshots
+
+Create a snapshot to read a consistent view.
+
+```crystal
+view = db.snapshot
+```
+
+A snapshot captures the store at one moment. Later writes, flushes, and
+compactions never change it. Read it like the database.
+
+```crystal
+view.get("forge-hammer")   # => "steel"
+view.scan("a", "z")        # => the pairs at capture time
+view.each("a", "z") do |key, value|
+  puts "#{key} => #{value}"
+end
+```
+
+A snapshot pins its table files. Close it to release them.
+
+```crystal
+view.close
+```
+
+You can keep a snapshot open while the database changes. This is useful for
+reporting, exports, or checks that must not change mid-run.
 
 ## Command line tool
 
@@ -241,6 +278,12 @@ merge yields the newest entry for each key. The bloom filter lets a reader
 skip a table that cannot contain the key. The block cache holds decoded
 blocks so repeated reads avoid disk.
 
+### Snapshots
+
+A snapshot copies the active memory table and opens its own readers. It pins
+the table files, so compaction defers their deletion until the snapshot
+closes. Reads use the captured state only.
+
 ### Recovery
 
 On open, the database replays the write ahead log into the memory table.
@@ -278,24 +321,26 @@ db = Cinderstore::DB.new("data", config)
 ## Project layout
 
 ```text
-src/cinderstore.cr       Library entry point
-src/cinderstore/         Core components
-src/cli.cr               Command line tool
-examples/demo.cr         Library walkthrough
-examples/server_demo.cr  Wire protocol walkthrough
-fixtures/catalog.csv     Sample product catalog
-spec/                    Test suite
+src/cinderstore.cr          Library entry point
+src/cinderstore/            Core components
+src/cli.cr                  Command line tool
+examples/demo.cr            Library walkthrough
+examples/snapshot_demo.cr   Snapshot walkthrough
+examples/server_demo.cr     Wire protocol walkthrough
+fixtures/catalog.csv        Sample product catalog
+spec/                       Test suite
 ```
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 82 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 93 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, and the server protocol.
+and the database. It covers compaction, durability, snapshots, and the
+server protocol.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
-formatting, runs the suite, and builds the binary.
+formatting, runs the suite, runs both examples, and builds the binary.
 
 ## Limitations
 
@@ -304,15 +349,26 @@ formatting, runs the suite, and builds the binary.
 - Keys are limited to 4 KB.
 - The server protocol is unencrypted. Use it on localhost only.
 - Compaction is a full merge. It is correct and simple, not incremental.
+- A snapshot copies the active memory table. A large table costs memory.
+- A snapshot pins its table files. Close it before you delete the directory.
+- Close snapshots before you reopen the same directory in a new instance.
 - No multi-threaded runtime is required. The server uses fibers.
 
 ## Roadmap
 
-- Release 0.2: incremental compaction by level
-- Release 0.3: snapshot iterators and consistent reads
-- Release 0.4: optional checksum-free fast mode
-- Release 0.5: batch writes and group commit
-- Release 0.6: secondary indexes
+Release 0.2.0 is the current release. It delivers snapshot iterators and
+consistent reads.
+
+Completed:
+
+- Snapshot iterators and consistent reads
+
+Planned:
+
+- Incremental compaction by level
+- Optional checksum-free fast mode
+- Batch writes and group commit
+- Secondary indexes
 
 ## License
 

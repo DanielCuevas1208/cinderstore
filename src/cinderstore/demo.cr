@@ -4,7 +4,8 @@ module Cinderstore
   # A self-contained walkthrough of the store.
   #
   # The demo loads a small product catalog, writes it, scans a range,
-  # flushes, compacts, and verifies recovery. Its output is deterministic.
+  # flushes, compacts, takes a snapshot, and verifies recovery. Its
+  # output is deterministic.
   class Demo
     def self.run(db_path : String? = nil, fixture : String? = nil) : Int32
       new(db_path, fixture).run
@@ -74,9 +75,24 @@ module Cinderstore
       puts "   scan count   => #{db.scan.size}"
       puts ""
 
+      puts "7. Snapshot gives a consistent point-in-time view"
+      snap = db.snapshot
+      puts "   snapshot rows: #{snap.scan.size}, snapshot sequence: #{snap.seq}"
+      %w[SKU-0005 SKU-0015 SKU-0020].each { |sku| db.delete(sku) }
+      db.put("SKU-0001", %({"name":"Forge Anvil 45kg","price":190.00,"stock":13}))
+      db.flush
+      db.compact
+      puts "   live rows after writes, flush, and compact: #{db.scan.size}"
+      puts "   snapshot rows: #{snap.scan.size}"
+      puts "   snapshot get SKU-0005 => #{snap.get("SKU-0005").inspect}"
+      puts "   live get SKU-0005      => #{db.get("SKU-0005").inspect}"
+      snap.close
+      puts "   snapshot closed; its tables are now freed"
+      puts ""
+
       db.close
 
-      puts "7. Reopen the database and verify recovery"
+      puts "8. Reopen the database and verify recovery"
       reopened = DB.new(path, config)
       count = reopened.scan.size
       puts "   rows after restart: #{count}"
