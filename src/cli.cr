@@ -4,6 +4,12 @@ require "./cinderstore"
 module Cinderstore
   # Command line interface for Cinderstore.
   class CLI
+    # Options shared by every command that opens a database.
+    private record Common, db_path : String = "cinderstore-data", checksums : Bool = true
+
+    # A parsed command line and the parser that produced it.
+    private record Parsed, common : Common, parser : OptionParser
+
     def self.run(args : Array(String)) : Int32
       new.run(args)
     end
@@ -36,21 +42,19 @@ module Cinderstore
     end
 
     private def run_server(rest : Array(String)) : Int32
-      db_path = "cinderstore-data"
       host = "127.0.0.1"
       port = 7654
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("--host HOST", "Bind address") { |v| host = v }
-      parser.on("--port PORT", "Listen on this port") { |v| port = v.to_i }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("--host HOST", "Bind address") { |v| host = v }
+        parser.on("--port PORT", "Listen on this port") { |v| port = v.to_i }
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(parsed.common.db_path, config_from(parsed.common))
       server = Server.new(db, host, port)
       server.run
       db.close
@@ -58,22 +62,20 @@ module Cinderstore
     end
 
     private def run_write(rest : Array(String)) : Int32
-      db_path = "cinderstore-data"
       key = ""
       value = ""
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("--key KEY", "Key to write") { |v| key = v }
-      parser.on("--value VALUE", "Value to write") { |v| value = v }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("--key KEY", "Key to write") { |v| key = v }
+        parser.on("--value VALUE", "Value to write") { |v| value = v }
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(parsed.common.db_path, config_from(parsed.common))
       begin
         db.put(key, value)
         puts "ok"
@@ -84,20 +86,18 @@ module Cinderstore
     end
 
     private def run_read(rest : Array(String)) : Int32
-      db_path = "cinderstore-data"
       key = ""
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("--key KEY", "Key to read") { |v| key = v }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("--key KEY", "Key to read") { |v| key = v }
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(parsed.common.db_path, config_from(parsed.common))
       begin
         if value = db.get(key)
           puts value
@@ -112,20 +112,18 @@ module Cinderstore
     end
 
     private def run_delete(rest : Array(String)) : Int32
-      db_path = "cinderstore-data"
       key = ""
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("--key KEY", "Key to delete") { |v| key = v }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("--key KEY", "Key to delete") { |v| key = v }
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(parsed.common.db_path, config_from(parsed.common))
       begin
         db.delete(key)
         puts "ok"
@@ -136,23 +134,21 @@ module Cinderstore
     end
 
     private def run_scan(rest : Array(String)) : Int32
-      db_path = "cinderstore-data"
       start_key = ""
       finish_key = ""
       limit = -1
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("--start KEY", "First key (inclusive)") { |v| start_key = v }
-      parser.on("--finish KEY", "Last key (exclusive)") { |v| finish_key = v }
-      parser.on("--limit N", "Maximum rows") { |v| limit = v.to_i }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("--start KEY", "First key (inclusive)") { |v| start_key = v }
+        parser.on("--finish KEY", "Last key (exclusive)") { |v| finish_key = v }
+        parser.on("--limit N", "Maximum rows") { |v| limit = v.to_i }
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(parsed.common.db_path, config_from(parsed.common))
       begin
         rows = db.scan(start_key, finish_key.empty? ? nil : finish_key, limit)
         rows.each do |key, value|
@@ -165,17 +161,15 @@ module Cinderstore
     end
 
     private def run_simple(action : String, rest : Array(String)) : Int32
-      db_path = "cinderstore-data"
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(parsed.common.db_path, config_from(parsed.common))
       begin
         case action
         when "stats"
@@ -197,16 +191,15 @@ module Cinderstore
       db_path = nil
       fixture = nil
       help = false
-      parser = OptionParser.new
-      parser.on("--db PATH", "Database directory") { |v| db_path = v }
-      parser.on("--fixture PATH", "CSV fixture file") { |v| fixture = v }
-      parser.on("-h", "--help", "Show this help") { help = true }
-      parser.parse(rest)
+      parsed = parse_common(rest) do |parser|
+        parser.on("--fixture PATH", "CSV fixture file") { |v| fixture = v }
+        parser.on("-h", "--help", "Show this help") { help = true }
+      end
       if help
-        puts parser
+        puts parsed.parser
         return 0
       end
-      Demo.run(db_path, fixture)
+      Demo.run(db_path, fixture, parsed.common.checksums)
     end
 
     private def print_help : Nil
@@ -229,6 +222,24 @@ module Cinderstore
 
         Run "cinderstore <command> --help" for command options.
         HELP
+    end
+
+    # Parses the shared options plus any command options.
+    private def parse_common(rest : Array(String), &) : Parsed
+      common = Common.new
+      parser = OptionParser.new
+      parser.on("--db PATH", "Database directory") { |v| common = Common.new(v, common.checksums) }
+      parser.on("--no-checksums", "Disable CRC32 checksums") { common = Common.new(common.db_path, false) }
+      yield parser
+      parser.parse(rest)
+      Parsed.new(common, parser)
+    end
+
+    # Returns a database config from the shared options.
+    private def config_from(common : Common) : DB::Config
+      config = DB::Config.new
+      config.checksums = common.checksums
+      config
     end
   end
 end

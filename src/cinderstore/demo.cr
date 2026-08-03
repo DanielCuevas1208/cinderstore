@@ -4,13 +4,14 @@ module Cinderstore
   # A self-contained walkthrough of the store.
   #
   # The demo loads a small product catalog, writes it, scans a range,
-  # flushes, compacts, and verifies recovery. Its output is deterministic.
+  # flushes, compacts, and verifies recovery. It then compares the two
+  # checksum modes on the same data. Its output is deterministic.
   class Demo
-    def self.run(db_path : String? = nil, fixture : String? = nil) : Int32
-      new(db_path, fixture).run
+    def self.run(db_path : String? = nil, fixture : String? = nil, checksums : Bool = true) : Int32
+      new(db_path, fixture, checksums).run
     end
 
-    def initialize(@db_path : String? = nil, @fixture : String? = nil)
+    def initialize(@db_path : String? = nil, @fixture : String? = nil, @checksums : Bool = true)
     end
 
     def run : Int32
@@ -25,6 +26,7 @@ module Cinderstore
       config = DB::Config.new
       config.sync_writes = false
       config.compact_on_flush = false
+      config.checksums = @checksums
       db = DB.new(path, config)
 
       puts "== Cinderstore #{VERSION} demo =="
@@ -103,6 +105,45 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "9. Compare the checksum modes on 400 synthetic products"
+      fast_path = "#{path}-fast"
+      checked_path = "#{path}-checked"
+      checked_config = DB::Config.new
+      checked_config.sync_writes = false
+      checked_config.compact_on_flush = false
+      fast_config = DB::Config.new
+      fast_config.sync_writes = false
+      fast_config.compact_on_flush = false
+      fast_config.checksums = false
+      checked_db = DB.new(checked_path, checked_config)
+      fast_db = DB.new(fast_path, fast_config)
+      synthetic_rows.each do |key, value|
+        checked_db.put(key, value)
+        fast_db.put(key, value)
+      end
+      checked_db.flush
+      checked_db.compact
+      fast_db.flush
+      fast_db.compact
+      checked_bytes = checked_db.stats.disk_bytes
+      fast_bytes = fast_db.stats.disk_bytes
+      puts "   checksummed rows: #{checked_db.scan.size}, disk bytes: #{checked_bytes}"
+      puts "   checksum-free rows: #{fast_db.scan.size}, disk bytes: #{fast_bytes}"
+      puts "   fast mode saves #{checked_bytes - fast_bytes} bytes and skips CRC32 work"
+      checked_db.close
+      fast_db.close
+      puts ""
+
+      puts "10. Reopen the checksum-free database and verify recovery"
+      reopened_fast = DB.new(fast_path, fast_config)
+      puts "   rows after restart: #{reopened_fast.scan.size}"
+      reopened_fast.close
+      puts ""
+
+      FileUtils.rm_rf(fast_path)
+      FileUtils.rm_rf(checked_path)
+
       puts "Demo complete."
       0
     end
@@ -136,5 +177,16 @@ module Cinderstore
       end
       rows
     end
+
+    # Returns deterministic products spread across several table blocks.
+    private def synthetic_rows : Array(Tuple(String, String))
+      Array.new(400) do |i|
+        key = "SKU-F%04d" % i
+        value = %({"name":"Fixture #{i}","price":#{i % 900},"stock":#{i % 50},"note":"#{NOTE_PAD}"})
+        {key, value}
+      end
+    end
+
+    NOTE_PAD = "x" * 64
   end
 end
