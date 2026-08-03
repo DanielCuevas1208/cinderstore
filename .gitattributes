@@ -1,0 +1,5 @@
+# Normalize every text file to LF on every platform.
+#
+# LF keeps `crystal tool format --check` stable in CI. The format check
+# treats CRLF files as changed, which fails on Windows checkouts.
+* text=auto eol=lf

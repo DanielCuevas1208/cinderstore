@@ -136,4 +136,170 @@ describe "Cinderstore compaction" do
       db.scan.size.should eq(25_000)
     end
   end
+
+  it "cascades level-0 tables through the deeper levels" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    config.max_level = 3
+    Cinderstore::SpecHelpers.with_db("compact-cascade", config) do |db, _path|
+      db.put("a", "1")
+      db.put("b", "2")
+      db.flush
+      db.put("c", "3")
+      db.put("d", "4")
+      db.flush
+      db.compact
+      db.stats.levels.should eq([0, 1])
+      db.stats.l0.should eq(0)
+      db.stats.l1.should eq(1)
+
+      db.put("e", "5")
+      db.put("f", "6")
+      db.flush
+      db.put("g", "7")
+      db.put("h", "8")
+      db.flush
+      db.compact
+      db.stats.levels.should eq([0, 0, 1])
+      db.stats.l2.should eq(1)
+      db.scan.map(&.[0]).should eq(%w[a b c d e f g h])
+      db.get("e").should eq("5")
+    end
+  end
+
+  it "keeps a tombstone while a deeper level still holds the key" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    config.max_level = 3
+    Cinderstore::SpecHelpers.with_db("compact-guard", config) do |db, _path|
+      # Build an old value for "k" at the deepest level.
+      db.put("k", "old")
+      db.put("a", "1")
+      db.put("b", "2")
+      db.put("c", "3")
+      db.flush
+      db.put("m", "4")
+      db.put("n", "5")
+      db.put("o", "6")
+      db.put("p", "7")
+      db.flush
+      db.compact
+      db.put("q", "8")
+      db.put("r", "9")
+      db.put("s", "10")
+      db.put("t", "11")
+      db.flush
+      db.put("u", "12")
+      db.put("v", "13")
+      db.put("w", "14")
+      db.put("x", "15")
+      db.flush
+      db.compact
+      db.stats.l2.should eq(1)
+      db.get("k").should eq("old")
+
+      # Delete "k". The merge into level 1 must keep the tombstone, because
+      # level 2 still holds the older value for "k".
+      db.put("k", "new")
+      db.delete("k")
+      db.put("y", "16")
+      db.put("z", "17")
+      db.flush
+      db.put("aa", "18")
+      db.put("bb", "19")
+      db.flush
+      db.compact
+      db.stats.levels.should eq([0, 1, 1])
+      db.get("k").should be_nil
+      db.get("y").should eq("16")
+      db.scan.map(&.[0]).should eq(%w[a aa b bb c m n o p q r s t u v w x y z])
+    end
+  end
+
+  it "drops a tombstone once the merge covers the deepest level" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    config.max_level = 3
+    Cinderstore::SpecHelpers.with_db("compact-expire", config) do |db, _path|
+      db.put("k", "old")
+      db.put("a", "1")
+      db.put("b", "2")
+      db.put("c", "3")
+      db.flush
+      db.put("m", "4")
+      db.put("n", "5")
+      db.put("o", "6")
+      db.put("p", "7")
+      db.flush
+      db.compact
+      db.put("q", "8")
+      db.put("r", "9")
+      db.put("s", "10")
+      db.put("t", "11")
+      db.flush
+      db.put("u", "12")
+      db.put("v", "13")
+      db.put("w", "14")
+      db.put("x", "15")
+      db.flush
+      db.compact
+
+      db.put("k", "new")
+      db.delete("k")
+      db.put("y", "16")
+      db.put("z", "17")
+      db.flush
+      db.put("aa", "18")
+      db.put("bb", "19")
+      db.flush
+      db.compact
+      db.get("k").should be_nil
+
+      # Two disjoint batches push level 1 past its threshold. The cascade
+      # merges level 1 into level 2, the deepest level. Every copy of "k"
+      # is inside the merge, so the tombstone is dropped.
+      db.put("zz", "20")
+      db.put("zza", "21")
+      db.flush
+      db.put("zzb", "22")
+      db.put("zzc", "23")
+      db.flush
+      db.compact
+      db.stats.levels.should eq([0, 0, 1])
+      db.stats.entries.should eq(23)
+      db.get("k").should be_nil
+      db.scan.map(&.[0]).should eq(%w[a aa b bb c m n o p q r s t u v w x y z zz zza zzb zzc])
+    end
+  end
+
+  it "recovers a multi-level layout after a restart" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    config.max_level = 3
+    Cinderstore::SpecHelpers.with_db_path("compact-deep-restart") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("a", "1")
+      db.put("b", "2")
+      db.flush
+      db.put("c", "3")
+      db.put("d", "4")
+      db.flush
+      db.compact
+      db.put("e", "5")
+      db.put("f", "6")
+      db.flush
+      db.put("g", "7")
+      db.put("h", "8")
+      db.flush
+      db.compact
+      db.stats.levels.should eq([0, 0, 1])
+      db.close
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.stats.levels.should eq([0, 0, 1])
+      reopened.scan.map(&.[0]).should eq(%w[a b c d e f g h])
+      reopened.get("f").should eq("6")
+      reopened.close
+    end
+  end
 end

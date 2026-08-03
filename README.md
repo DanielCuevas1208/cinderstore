@@ -1,17 +1,12 @@
 # Cinderstore
 
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
-<!-- Replace <owner>/<repo> with your repository path. -->
+[![CI](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml)
 
-Cinderstore is an embeddable key and value store. It is built on a log
-structured merge tree (LSM tree). It is written in Crystal and uses only the
-Crystal standard library.
+Cinderstore is an embeddable key and value store. It is built on a log structured merge tree (LSM tree). It is written in Crystal and uses only the Crystal standard library.
 
-The store keeps a write ahead log for durability. It flushes memory to sorted
-files. It merges those files during compaction. It recovers all data after a
-restart. It serves `get`, `put`, and `delete` over a local socket.
+The store keeps a write ahead log for durability. It flushes memory to sorted files. It merges overflowing files during compaction. It recovers all data after a restart. It serves `get`, `put`, and `delete` over a local socket.
 
-This is release 0.1.0. It is the first coherent release.
+This is release 0.2.0. It adds leveled compaction.
 
 ## Features
 
@@ -20,6 +15,7 @@ This is release 0.1.0. It is the first coherent release.
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Background flush and compaction
+- Multi-level compaction that rewrites only the tables it must touch
 - Range scans with an iterator API
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
@@ -50,12 +46,10 @@ bin/cinderstore demo
 
 ## Demo output
 
-The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
-scans, flushes, compacts, deletes, and reopens a database. The output is
-deterministic.
+The demo loads a product catalog from `fixtures/catalog.csv`. It writes, scans, flushes, compacts, and reopens a database. The output is deterministic.
 
 ```text
-== Cinderstore 0.1.0 demo ==
+== Cinderstore 0.2.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -72,24 +66,35 @@ Database directory: ...\cinderstore-demo
    ... (24 rows in the store)
 
 3. Flush memtable to a sorted table
-   tables: 1 (l0: 1, l1: 0), entries: 24
+   tables: 1 (levels: [1]), entries: 24
    disk bytes: 1649, memtable bytes: 0
 
 4. Delete 4 products, update 2 products, then flush again
-   tables: 2 (l0: 2, l1: 0), entries: 30
+   tables: 2 (levels: [2]), entries: 30
    disk bytes: 1902, memtable bytes: 0
+   The deleted keys still occupy space in the level-0 tables.
 
-5. Compact merges the tables and drops the deleted keys
-   tables: 1 (l0: 0, l1: 1), entries: 20
+5. Compact merges the level-0 tables into level 1
+   tables: 1 (levels: [0, 1]), entries: 20
    disk bytes: 1384, memtable bytes: 0
+   The store keeps the newest value for each key.
 
 6. Verify deletes and updates after compaction
    get SKU-0003 => nil
-   get SKU-0001 => {"name":"Forge Anvil 45kg","price":175.00,"stock":14}
+   get SKU-0001 => "{\"name\":\"Forge Anvil 45kg\",\"price\":175.00,\"stock\":14}"
    scan count   => 20
 
 7. Reopen the database and verify recovery
    rows after restart: 20
+
+8. Add 32 spare parts across four flushes, then compact
+   tables: 1 (levels: [0, 0, 1]), entries: 52
+   disk bytes: 3366, memtable bytes: 0
+   The spare parts cascade into a fresh level-2 table.
+
+9. Reopen again and verify the full store
+   rows after restart: 52
+   levels after restart: [0, 0, 1]
 
 Demo complete.
 ```
@@ -127,13 +132,12 @@ Flush and compact explicitly.
 
 ```crystal
 db.flush    # Move the memtable into a table.
-db.compact  # Merge tables and drop deleted keys.
+db.compact  # Merge overflowing levels into deeper levels.
 ```
 
 ## Command line tool
 
-The tool uses a database directory. The default directory is
-`cinderstore-data`.
+The tool uses a database directory. The default directory is `cinderstore-data`.
 
 Write a value.
 
@@ -175,9 +179,7 @@ Run `bin/cinderstore help` for the full list of commands.
 
 ## Wire protocol
 
-The server listens on `127.0.0.1:7654` by default. Commands are lines of
-text. A command ends with a newline. Keys must not contain spaces or
-newlines. Values must not contain newlines.
+The server listens on `127.0.0.1:7654` by default. Commands are lines of text. A command ends with a newline. Keys must not contain spaces or newlines. Values must not contain newlines.
 
 | Command | Meaning |
 | --- | --- |
@@ -208,8 +210,7 @@ printf "PUT forge-hammer steel\nGET forge-hammer\n" | nc 127.0.0.1 7654
 
 ## Architecture
 
-The database stores data in a single directory. The directory contains a
-manifest, one write ahead log, and sorted tables.
+The database stores data in a single directory. The directory contains a manifest, one write ahead log, and sorted tables. Tables live in levels.
 
 ### Write path
 
@@ -218,34 +219,23 @@ A write goes to two places at once.
 1. Append the entry to the write ahead log.
 2. Insert the entry into the memory table.
 
-The default mode fsyncs after every write. Set `sync_writes` to `false` for
-faster, less durable writes.
+The default mode fsyncs after every write. Set `sync_writes` to `false` for faster, less durable writes.
 
 ### Flush
 
-When the memory table grows past its limit, the database freezes it. A new
-memory table starts. A background task writes the frozen table to a sorted
-file. The old log is deleted only after the file is durable.
+When the memory table grows past its limit, the database freezes it. A new memory table starts. A background task writes the frozen table to a sorted file. The old log is deleted only after the file is durable.
 
 ### Compaction
 
-Level-0 tables may overlap. Compaction merges every table into a fresh,
-non-overlapping level-1 set. The merge keeps the newest entry for each key.
-It drops tombstones, because it includes all data. New writes continue into
-the memory table during the merge.
+Level-0 tables may overlap. Compaction merges a level that grew past its limit into the next level. Each merge keeps the newest entry for every key. Tables that do not overlap the merge range stay in place. A tombstone is dropped only when the merge covers every copy of its key. New writes continue into the memory table during the merge.
 
 ### Read path
 
-A read merges the memory table, any frozen table, and all sorted tables. The
-merge yields the newest entry for each key. The bloom filter lets a reader
-skip a table that cannot contain the key. The block cache holds decoded
-blocks so repeated reads avoid disk.
+A read merges the memory table, any frozen table, and all sorted tables. The merge yields the newest entry for each key. The bloom filter lets a reader skip a table that cannot contain the key. The block cache holds decoded blocks so repeated reads avoid disk.
 
 ### Recovery
 
-On open, the database replays the write ahead log into the memory table.
-Recovery is idempotent. A torn tail is detected by its CRC32 and skipped.
-The manifest lists every table. Orphan files from a crash are removed.
+On open, the database replays the write ahead log into the memory table. Recovery is idempotent. A torn tail is detected by its CRC32 and skipped. The manifest lists every table. Orphan files from a crash are removed.
 
 ## On-disk format
 
@@ -271,9 +261,13 @@ config.bloom_fpp = 0.01
 config.cache_blocks = 512
 config.sync_writes = true
 config.l0_compact_threshold = 4
+config.l1_compact_threshold = 4
+config.max_level = 6
 config.compact_on_flush = true
 db = Cinderstore::DB.new("data", config)
 ```
+
+The thresholds set the table count that triggers a level merge. The `max_level` value bounds the deepest level. Lower thresholds compact sooner but rewrite more often.
 
 ## Project layout
 
@@ -289,13 +283,9 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 82 examples. All pass on Windows
-and Linux. It covers the skip list, the memory table, the write ahead log,
-the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, and the server protocol.
+The suite runs with `crystal spec`. It has 86 examples. All pass on Windows and Linux. It covers the skip list, the memory table, the write ahead log, the bloom filter, and the block cache. It covers the tables, the iterators, and the database. It covers compaction, leveled cascades, tombstone lifecycle, durability, and the server protocol.
 
-The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
-formatting, runs the suite, and builds the binary.
+The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks formatting, runs the suite, runs the demo, and builds the binary.
 
 ## Limitations
 
@@ -303,12 +293,12 @@ formatting, runs the suite, and builds the binary.
 - Values are limited to 4 MB.
 - Keys are limited to 4 KB.
 - The server protocol is unencrypted. Use it on localhost only.
-- Compaction is a full merge. It is correct and simple, not incremental.
+- Compaction merges whole levels. It is correct and simple, not incremental within a level.
 - No multi-threaded runtime is required. The server uses fibers.
 
 ## Roadmap
 
-- Release 0.2: incremental compaction by level
+- Release 0.2: leveled compaction (complete)
 - Release 0.3: snapshot iterators and consistent reads
 - Release 0.4: optional checksum-free fast mode
 - Release 0.5: batch writes and group commit

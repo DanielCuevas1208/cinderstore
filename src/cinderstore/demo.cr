@@ -25,6 +25,8 @@ module Cinderstore
       config = DB::Config.new
       config.sync_writes = false
       config.compact_on_flush = false
+      config.l1_compact_threshold = 2
+      config.max_level = 3
       db = DB.new(path, config)
 
       puts "== Cinderstore #{VERSION} demo =="
@@ -62,7 +64,7 @@ module Cinderstore
       puts "   The deleted keys still occupy space in the level-0 tables."
       puts ""
 
-      puts "5. Compact merges the tables and drops the deleted keys"
+      puts "5. Compact merges the level-0 tables into level 1"
       db.compact
       print_stats(db)
       puts "   The store keeps the newest value for each key."
@@ -82,13 +84,38 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "8. Add 32 spare parts across four flushes, then compact"
+      writer = DB.new(path, config)
+      4.times do |batch|
+        8.times do |i|
+          n = batch * 8 + i + 1
+          writer.put("SPARE-%03d" % n, spare_value(n))
+        end
+        writer.flush
+      end
+      writer.compact
+      print_stats(writer)
+      puts "   The spare parts cascade into a fresh level-2 table."
+      puts ""
+
+      puts "9. Reopen again and verify the full store"
+      final = DB.new(path, config)
+      puts "   rows after restart: #{final.scan.size}"
+      puts "   levels after restart: #{final.stats.levels}"
+      final.close
+      puts ""
       puts "Demo complete."
       0
     end
 
+    private def spare_value(n : Int32) : String
+      %({"name":"Spare Part #{n}","price":5.00,"stock":10})
+    end
+
     private def print_stats(db : DB) : Nil
       stats = db.stats
-      puts "   tables: #{stats.tables} (l0: #{stats.l0}, l1: #{stats.l1}), entries: #{stats.entries}"
+      puts "   tables: #{stats.tables} (levels: #{stats.levels}), entries: #{stats.entries}"
       puts "   disk bytes: #{stats.disk_bytes}, memtable bytes: #{stats.memtable_bytes}"
     end
 
