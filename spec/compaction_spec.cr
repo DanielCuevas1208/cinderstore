@@ -136,4 +136,148 @@ describe "Cinderstore compaction" do
       db.scan.size.should eq(25_000)
     end
   end
+
+  it "leaves disjoint level-1 tables in place during a level-0 merge" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("compact-incremental", config) do |db, _path|
+      5.times { |i| db.put("r1-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("r1-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l1.should eq(1)
+
+      5.times { |i| db.put("r2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("r2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      db.stats.tables.should eq(2)
+      db.stats.l0.should eq(0)
+      db.stats.l1.should eq(2)
+      db.scan.size.should eq(20)
+      db.get("r1-03").should eq("v")
+      db.get("r2-07").should eq("v")
+    end
+  end
+
+  it "cascades a full level into the next level" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db("compact-cascade", config) do |db, _path|
+      5.times { |i| db.put("s1-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s1-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l1.should eq(1)
+
+      5.times { |i| db.put("s2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      db.stats.tables.should eq(1)
+      db.stats.l0.should eq(0)
+      db.stats.l1.should eq(0)
+      db.stats.l2.should eq(1)
+      db.scan.size.should eq(20)
+      db.get("s1-04").should eq("v")
+      db.get("s2-09").should eq("v")
+    end
+  end
+
+  it "keeps tombstones while a deeper level may hold older data" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db("compact-tombstone-level", config) do |db, _path|
+      2.times do |round|
+        prefix = "s#{round + 1}"
+        5.times { |i| db.put("#{prefix}-%02d" % i, "v") }
+        db.flush
+        5.times { |i| db.put("#{prefix}-%02d" % (i + 5), "v") }
+        db.flush
+        db.compact
+      end
+      db.stats.l2.should eq(1)
+      db.stats.l1.should eq(0)
+
+      db.put("gone", "old")
+      db.flush
+      db.delete("gone")
+      db.flush
+      db.compact
+
+      db.get("gone").should be_nil
+      db.stats.l1.should eq(1)
+      db.stats.l2.should eq(1)
+      db.scan.map(&.[0]).should_not contain("gone")
+    end
+  end
+
+  it "drops tombstones when compaction reaches the deepest level" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db("compact-tombstone-drop", config) do |db, _path|
+      db.put("gone", "old")
+      5.times { |i| db.put("s1-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s1-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      5.times { |i| db.put("s2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l2.should eq(1)
+
+      db.delete("gone")
+      db.flush
+      5.times { |i| db.put("j1-%02d" % i, "v") }
+      db.flush
+      db.compact
+
+      5.times { |i| db.put("j2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("j2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      db.get("gone").should be_nil
+      db.stats.l1.should eq(0)
+      db.stats.l2.should eq(1)
+      db.scan.map(&.[0]).should_not contain("gone")
+    end
+  end
+
+  it "persists tables on several levels across a restart" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db_path("compact-levels-restart") do |path|
+      db = Cinderstore::DB.new(path, config)
+      5.times { |i| db.put("s1-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s1-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      5.times { |i| db.put("s2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l2.should eq(1)
+      db.close
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.stats.levels.should eq([0, 0, 1])
+      reopened.scan.size.should eq(20)
+      reopened.get("s1-07").should eq("v")
+      reopened.get("s2-03").should eq("v")
+      reopened.close
+    end
+  end
 end

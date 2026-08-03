@@ -25,6 +25,7 @@ module Cinderstore
       config = DB::Config.new
       config.sync_writes = false
       config.compact_on_flush = false
+      config.l1_compact_threshold = 2
       db = DB.new(path, config)
 
       puts "== Cinderstore #{VERSION} demo =="
@@ -69,8 +70,8 @@ module Cinderstore
       puts ""
 
       puts "6. Verify deletes and updates after compaction"
-      puts "   get SKU-0003 => #{db.get("SKU-0003").inspect}"
-      puts "   get SKU-0001 => #{db.get("SKU-0001").inspect}"
+      puts "   get SKU-0003 => #{db.get("SKU-0003") || "nil"}"
+      puts "   get SKU-0001 => #{db.get("SKU-0001") || "nil"}"
       puts "   scan count   => #{db.scan.size}"
       puts ""
 
@@ -80,6 +81,27 @@ module Cinderstore
       reopened = DB.new(path, config)
       count = reopened.scan.size
       puts "   rows after restart: #{count}"
+      puts ""
+
+      puts "8. Flush two disjoint ranges, then compact incrementally"
+      %w[TOOL-0001 TOOL-0002 TOOL-0003 TOOL-0004 TOOL-0005].each do |sku|
+        reopened.put(sku, %({"name":"Tool Rack #{sku}","price":12.50,"stock":40}))
+      end
+      reopened.flush
+      %w[GADG-0001 GADG-0002 GADG-0003 GADG-0004 GADG-0005].each do |sku|
+        reopened.put(sku, %({"name":"Gadget #{sku}","price":8.75,"stock":55}))
+      end
+      reopened.flush
+      print_stats(reopened)
+      puts "   The new ranges wait in level 0. The level-1 table stays in place."
+      puts ""
+
+      puts "9. Compact cascades the merged ranges into level 2"
+      reopened.compact
+      print_stats(reopened)
+      puts "   Compaction merged every level-1 table into a single level-2 table."
+      puts ""
+
       reopened.close
       puts ""
       puts "Demo complete."
@@ -88,7 +110,12 @@ module Cinderstore
 
     private def print_stats(db : DB) : Nil
       stats = db.stats
-      puts "   tables: #{stats.tables} (l0: #{stats.l0}, l1: #{stats.l1}), entries: #{stats.entries}"
+      labels = [] of String
+      stats.levels.each_with_index do |count, i|
+        labels << "l#{i}: #{count}" if count > 0
+      end
+      label = labels.empty? ? "empty" : labels.join(", ")
+      puts "   tables: #{stats.tables} (#{label}), entries: #{stats.entries}"
       puts "   disk bytes: #{stats.disk_bytes}, memtable bytes: #{stats.memtable_bytes}"
     end
 

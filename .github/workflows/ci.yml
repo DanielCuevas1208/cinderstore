@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Crystal
-        uses: crystal-lang/setup-crystal@v2
+        uses: crystal-lang/install-crystal@v1
         with:
           crystal: 1.21.0
 
