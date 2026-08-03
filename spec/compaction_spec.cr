@@ -136,4 +136,161 @@ describe "Cinderstore compaction" do
       db.scan.size.should eq(25_000)
     end
   end
+
+  it "leaves disjoint level-1 tables in place during a level-0 merge" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("compact-incremental", config) do |db, _path|
+      5.times { |i| db.put("r1-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("r1-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l1.should eq(1)
+
+      5.times { |i| db.put("r2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("r2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      db.stats.tables.should eq(2)
+      db.stats.l0.should eq(0)
+      db.stats.l1.should eq(2)
+      db.scan.size.should eq(20)
+      db.get("r1-03").should eq("v")
+      db.get("r2-07").should eq("v")
+    end
+  end
+
+  it "rewrites only the tables that overlap a level-0 merge" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("compact-partial", config) do |db, _path|
+      5.times { |i| db.put("left-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("left-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l1.should eq(1)
+
+      5.times { |i| db.put("mid-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("mid-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      # The mid table overlaps the new level-0 pair, so it merges with
+      # them. The left table stays untouched.
+      db.stats.tables.should eq(2)
+      db.stats.l1.should eq(2)
+      db.scan.size.should eq(20)
+      db.get("left-04").should eq("v")
+      db.get("mid-09").should eq("v")
+    end
+  end
+
+  it "cascades a full level into the next level" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db("compact-cascade", config) do |db, _path|
+      5.times { |i| db.put("s1-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s1-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+      db.stats.l1.should eq(1)
+
+      5.times { |i| db.put("s2-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s2-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      db.stats.tables.should eq(1)
+      db.stats.l0.should eq(0)
+      db.stats.l1.should eq(0)
+      db.stats.l2.should eq(1)
+      db.scan.size.should eq(20)
+      db.get("s1-04").should eq("v")
+      db.get("s2-09").should eq("v")
+    end
+  end
+
+  it "keeps tombstones while a deeper level may hold older data" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db("compact-tombstone-level", config) do |db, _path|
+      2.times do |round|
+        prefix = "s#{round + 1}"
+        5.times { |i| db.put("#{prefix}-%02d" % i, "v") }
+        db.flush
+        5.times { |i| db.put("#{prefix}-%02d" % (i + 5), "v") }
+        db.flush
+        db.compact
+      end
+      # Level 2 now holds every key. Level 1 is empty.
+      db.stats.l2.should eq(1)
+      db.get("s1-00").should eq("v")
+
+      # Two tombstones land at level 0. A level-0 merge cannot drop them,
+      # because level 2 still holds older values for the same keys.
+      db.delete("s1-00")
+      db.flush
+      db.delete("s1-01")
+      db.flush
+      db.compact
+      db.get("s1-00").should be_nil
+      db.get("s1-01").should be_nil
+      db.stats.tables.should eq(2)
+      db.stats.l1.should eq(1)
+      db.stats.l2.should eq(1)
+
+      # Feed level 1 to the threshold. Compaction now reaches the bottom
+      # level and safely drops the tombstones.
+      5.times { |i| db.put("s3-%02d" % i, "v") }
+      db.flush
+      5.times { |i| db.put("s3-%02d" % (i + 5), "v") }
+      db.flush
+      db.compact
+
+      db.get("s1-00").should be_nil
+      db.get("s1-01").should be_nil
+      db.stats.l2.should eq(1)
+      db.scan.size.should eq(28)
+    end
+  end
+
+  it "keeps the store correct after restart following leveled compaction" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.l1_compact_threshold = 2
+    Cinderstore::SpecHelpers.with_db_path("compact-level-restart") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("a", "1")
+      db.put("b", "2")
+      db.flush
+      db.put("c", "3")
+      db.put("d", "4")
+      db.flush
+      db.compact
+
+      db.put("e", "5")
+      db.flush
+      db.put("f", "6")
+      db.flush
+      db.compact
+
+      db.stats.l2.should eq(1)
+      db.close
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.stats.l2.should eq(1)
+      reopened.get("a").should eq("1")
+      reopened.get("b").should eq("2")
+      reopened.get("c").should eq("3")
+      reopened.get("d").should eq("4")
+      reopened.get("e").should eq("5")
+      reopened.get("f").should eq("6")
+      reopened.scan.map(&.[0]).should eq(%w[a b c d e f])
+      reopened.close
+    end
+  end
 end

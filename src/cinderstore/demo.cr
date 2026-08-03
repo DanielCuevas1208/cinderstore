@@ -66,6 +66,7 @@ module Cinderstore
       db.compact
       print_stats(db)
       puts "   The store keeps the newest value for each key."
+      puts "   The merge folds level-0 tables into one level-1 table."
       puts ""
 
       puts "6. Verify deletes and updates after compaction"
@@ -88,7 +89,7 @@ module Cinderstore
 
     private def print_stats(db : DB) : Nil
       stats = db.stats
-      puts "   tables: #{stats.tables} (l0: #{stats.l0}, l1: #{stats.l1}), entries: #{stats.entries}"
+      puts "   tables: #{stats.tables} (levels: #{stats.levels}), entries: #{stats.entries}"
       puts "   disk bytes: #{stats.disk_bytes}, memtable bytes: #{stats.memtable_bytes}"
     end
 

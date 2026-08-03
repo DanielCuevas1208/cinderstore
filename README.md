@@ -1,17 +1,16 @@
 # Cinderstore
 
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
-<!-- Replace <owner>/<repo> with your repository path. -->
+[![CI](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml)
 
 Cinderstore is an embeddable key and value store. It is built on a log
 structured merge tree (LSM tree). It is written in Crystal and uses only the
 Crystal standard library.
 
-The store keeps a write ahead log for durability. It flushes memory to sorted
-files. It merges those files during compaction. It recovers all data after a
-restart. It serves `get`, `put`, and `delete` over a local socket.
+The store keeps a write ahead log for durability. It flushes memory to
+sorted files. It merges those files during compaction. It recovers all data
+after a restart. It serves `get`, `put`, and `delete` over a local socket.
 
-This is release 0.1.0. It is the first coherent release.
+This is release 0.2.0. It adds leveled compaction.
 
 ## Features
 
@@ -20,6 +19,7 @@ This is release 0.1.0. It is the first coherent release.
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Background flush and compaction
+- Leveled compaction that rewrites only the data it must touch
 - Range scans with an iterator API
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
@@ -55,7 +55,7 @@ scans, flushes, compacts, deletes, and reopens a database. The output is
 deterministic.
 
 ```text
-== Cinderstore 0.1.0 demo ==
+== Cinderstore 0.2.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -72,16 +72,19 @@ Database directory: ...\cinderstore-demo
    ... (24 rows in the store)
 
 3. Flush memtable to a sorted table
-   tables: 1 (l0: 1, l1: 0), entries: 24
+   tables: 1 (levels: [1]), entries: 24
    disk bytes: 1649, memtable bytes: 0
 
 4. Delete 4 products, update 2 products, then flush again
-   tables: 2 (l0: 2, l1: 0), entries: 30
+   tables: 2 (levels: [2]), entries: 30
    disk bytes: 1902, memtable bytes: 0
+   The deleted keys still occupy space in the level-0 tables.
 
 5. Compact merges the tables and drops the deleted keys
-   tables: 1 (l0: 0, l1: 1), entries: 20
+   tables: 1 (levels: [0, 1]), entries: 20
    disk bytes: 1384, memtable bytes: 0
+   The store keeps the newest value for each key.
+   The merge folds level-0 tables into one level-1 table.
 
 6. Verify deletes and updates after compaction
    get SKU-0003 => nil
@@ -229,10 +232,20 @@ file. The old log is deleted only after the file is durable.
 
 ### Compaction
 
-Level-0 tables may overlap. Compaction merges every table into a fresh,
-non-overlapping level-1 set. The merge keeps the newest entry for each key.
-It drops tombstones, because it includes all data. New writes continue into
-the memory table during the merge.
+Tables live in levels. Level 0 holds fresh flushes. Its tables may overlap.
+Every deeper level holds disjoint, sorted tables. Deeper levels hold older
+data.
+
+Compaction selects the topmost level that is full. Level 0 compacts when it
+holds two tables, or four in the background. Deeper levels compact when they
+hold `l1_compact_threshold` tables. A merge folds one level into the next.
+
+A merge rewrites only the tables it must touch. Disjoint tables stay in
+place. This bounds each compaction to a small part of the store.
+
+A tombstone hides older values. It is safe to drop only when the merge
+covers every table that could hold an older value. That happens only at the
+deepest level. Tombstones survive shallower merges.
 
 ### Read path
 
@@ -271,9 +284,15 @@ config.bloom_fpp = 0.01
 config.cache_blocks = 512
 config.sync_writes = true
 config.l0_compact_threshold = 4
+config.l1_compact_threshold = 4
+config.max_level = 6
 config.compact_on_flush = true
 db = Cinderstore::DB.new("data", config)
 ```
+
+`l1_compact_threshold` sets the merge point for deeper levels. `max_level`
+caps how deep a merge may write. Smaller values reduce table count and read
+amplification. They also do more merge work.
 
 ## Project layout
 
@@ -289,10 +308,11 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 82 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 87 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, and the server protocol.
+and the database. It covers leveled compaction, tombstone safety, and the
+server protocol.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, and builds the binary.
@@ -303,12 +323,19 @@ formatting, runs the suite, and builds the binary.
 - Values are limited to 4 MB.
 - Keys are limited to 4 KB.
 - The server protocol is unencrypted. Use it on localhost only.
-- Compaction is a full merge. It is correct and simple, not incremental.
+- Compaction merges whole levels, not individual blocks.
 - No multi-threaded runtime is required. The server uses fibers.
 
 ## Roadmap
 
-- Release 0.2: incremental compaction by level
+Completed:
+
+- Release 0.2: leveled compaction. Merges now touch only the tables in one
+  level and its overlapping neighbors. Tombstones drop only at the deepest
+  level.
+
+Planned:
+
 - Release 0.3: snapshot iterators and consistent reads
 - Release 0.4: optional checksum-free fast mode
 - Release 0.5: batch writes and group commit
