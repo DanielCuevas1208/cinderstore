@@ -223,7 +223,7 @@ module Cinderstore
           scan        List keys in a range
           stats       Show database counters
           flush       Flush the memtable to a table
-          compact     Merge tables and drop stale data
+          compact     Merge tables across the levels
           demo        Run a self-contained walkthrough
           help        Show this help
 

@@ -103,8 +103,49 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "9. Leveled compaction pushes older data into deeper levels"
+      leveled_config = DB::Config.new
+      leveled_config.sync_writes = false
+      leveled_config.compact_on_flush = false
+      leveled_config.base_level_bytes = 2_000
+      leveled_config.level_multiplier = 4
+      leveled_path = File.join(Dir.tempdir, "cinderstore-levels")
+      FileUtils.rm_rf(leveled_path) if File.exists?(leveled_path)
+      leveled = DB.new(leveled_path, leveled_config)
+      begin
+        4.times do |round|
+          %w[a b].each do |half|
+            12.times do |i|
+              leveled.put("part-#{round}-#{half}-%02d" % i,
+                %({"name":"Part #{round} #{half} #{i}","size":#{i + round * 10}}))
+            end
+            leveled.flush
+          end
+          leveled.compact
+          puts "   round #{round + 1}: #{level_summary(leveled.stats)}"
+        end
+        leveled.put("checkpoint", "42")
+        5.times { |i| leveled.put("post-%02d" % i, "v#{i}") }
+        leveled.flush
+        5.times { |i| leveled.put("post2-%02d" % i, "v#{i}") }
+        leveled.flush
+        leveled.compact
+        puts "   after a final compact: #{level_summary(leveled.stats)}"
+        puts "   rows: #{leveled.scan.size}, checkpoint: #{leveled.get("checkpoint")}"
+      ensure
+        leveled.close
+        FileUtils.rm_rf(leveled_path)
+      end
+      puts ""
+
       puts "Demo complete."
       0
+    end
+
+    private def level_summary(stats : DB::Stats) : String
+      counts = stats.levels.map_with_index { |count, i| "l#{i}: #{count}" }.join(", ")
+      "tables: #{stats.tables} (#{counts}), entries: #{stats.entries}"
     end
 
     private def print_stats(db : DB) : Nil
