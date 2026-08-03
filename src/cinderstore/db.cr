@@ -28,6 +28,9 @@ module Cinderstore
       property cache_blocks : Int32 = 512
       # Fsync after every write when true.
       property sync_writes : Bool = true
+      # Write and verify checksums when true. Disable for faster, less
+      # durable I/O. Readers always follow the flag stored in each file.
+      property checksums : Bool = true
       # Number of level-0 tables that trigger compaction.
       property l0_compact_threshold : Int32 = 4
       # Start background compaction after a flush when true.
@@ -46,13 +49,15 @@ module Cinderstore
       getter seq : Int64
       getter cache_hits : Int64
       getter cache_misses : Int64
+      getter checksums : Bool
 
       def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @entries : Int64,
                      @disk_bytes : Int64, @memtable_bytes : Int64, @wal_bytes : Int64,
-                     @seq : Int64, @cache_hits : Int64, @cache_misses : Int64)
+                     @seq : Int64, @cache_hits : Int64, @cache_misses : Int64,
+                     @checksums : Bool)
       end
 
-      def to_h : Hash(String, Int32 | Int64)
+      def to_h : Hash(String, Int32 | Int64 | Bool)
         {
           "tables"         => @tables,
           "l0"             => @l0,
@@ -64,6 +69,7 @@ module Cinderstore
           "seq"            => @seq,
           "cache_hits"     => @cache_hits,
           "cache_misses"   => @cache_misses,
+          "checksums"      => @checksums,
         }
       end
 
@@ -78,7 +84,8 @@ module Cinderstore
         io << "memtable bytes: #{@memtable_bytes}\n"
         io << "wal bytes: #{@wal_bytes}\n"
         io << "sequence: #{@seq}\n"
-        io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}"
+        io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}\n"
+        io << "checksums: #{@checksums}"
       end
     end
 
@@ -286,6 +293,13 @@ module Cinderstore
         Dir.children(@path).each do |name|
           wal_bytes += file_size(File.join(@path, name)) if name.ends_with?(WAL_SUFFIX)
         end
+        # The mode of the newest table describes the durable data. Before
+        # any table exists, the session config decides the mode.
+        checksums = if ref = table_refs.max_by?(&.id)
+                      ref.reader(@block_cache).checksums?
+                    else
+                      @config.checksums
+                    end
         Stats.new(
           tables: table_refs.size,
           l0: @levels[0].size,
@@ -297,6 +311,7 @@ module Cinderstore
           seq: @seq,
           cache_hits: @block_cache.hits,
           cache_misses: @block_cache.misses,
+          checksums: checksums,
         )
       end
     end
@@ -374,7 +389,7 @@ module Cinderstore
     private def create_active_wal : Nil
       id = @next_id
       @next_id += 1
-      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes)
+      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes, @config.checksums)
     end
 
     # ------------------------------------------------------------------
@@ -429,7 +444,7 @@ module Cinderstore
           @next_id += 1
           wal_id = @next_id
           @next_id += 1
-          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes)
+          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes, @config.checksums)
         end
       end
 
@@ -459,7 +474,7 @@ module Cinderstore
       final_path = table_path(table_id)
       meta = nil
       File.open(tmp_path, "w") do |io|
-        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp)
+        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         mem.each_entry do |entry|
           writer.add(entry.key, entry.value, entry.seq, entry.alive)
         end
@@ -557,7 +572,7 @@ module Cinderstore
             id
           end
           io = File.open(File.join(@path, "#{Util.file_stem(current_id)}#{TMP_SUFFIX}"), "w")
-          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp)
+          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         end
         writer.not_nil!.add(entry.key, entry.value, entry.seq, true)
         written += 1

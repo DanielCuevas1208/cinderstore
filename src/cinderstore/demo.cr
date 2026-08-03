@@ -103,6 +103,30 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "9. Fast mode skips checksums"
+      fast_path = File.join(Dir.tempdir, "cinderstore-demo-fast")
+      FileUtils.rm_rf(fast_path) if File.exists?(fast_path)
+      fast_config = DB::Config.new
+      fast_config.sync_writes = false
+      fast_config.checksums = false
+      fast_db = DB.new(fast_path, fast_config)
+      fast_db.put("SKU-0030", %({"name":"Tinder Box Brass","price":12.50,"stock":28}))
+      fast_db.put("SKU-0031", %({"name":"Coal Scuttle Iron","price":39.90,"stock":12}))
+      fast_db.flush
+      fast_db.put("SKU-0032", %({"name":"Damper Wrench","price":18.75,"stock":23}))
+      fast_db.compact
+      puts "   checksums: #{fast_db.stats.checksums}, tables: #{fast_db.stats.tables}"
+      puts "   get SKU-0032 => #{fast_db.get("SKU-0032").inspect}"
+      fast_db.close
+      # A default reopen reads the fast-mode files. Each file records its
+      # own checksum mode, so readers need no configuration.
+      reopened_fast = DB.new(fast_path)
+      puts "   default reopen reads: #{reopened_fast.scan.size} rows"
+      reopened_fast.close
+      FileUtils.rm_rf(fast_path)
+      puts ""
+
       puts "Demo complete."
       0
     end

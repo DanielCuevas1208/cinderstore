@@ -35,14 +35,21 @@ module Cinderstore
   # table that cannot contain a key. The footer stores offsets and a CRC32
   # over the entire footer.
   class SstableWriter
-    MAGIC       = 0x43494E4445525F31_u64
-    VERSION     =                  1_u32
-    FOOTER_SIZE =                     48
+    MAGIC          = 0x43494E4445525F31_u64
+    VERSION        =                  2_u32
+    VERSION_V1     =                  1_u32
+    VERSION_V2     =                  2_u32
+    FOOTER_SIZE_V1 =                     48
+    FOOTER_SIZE_V2 =                     49
+    FOOTER_SIZE    = FOOTER_SIZE_V2
+    # Version 2 footer flag. Cleared when checksums are disabled.
+    FLAG_CHECKSUMS = 0x01_u8
 
     @io : IO
     @id : Int64
     @block_size : Int32
     @fpp : Float64
+    @checksums : Bool
     @pending : IO::Memory
     @pending_keys : Array(String)
     @keys : Array(String)
@@ -51,7 +58,8 @@ module Cinderstore
     @first : String?
     @last : String?
 
-    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01)
+    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01,
+                   @checksums : Bool = true)
       @io = io
       @pending = IO::Memory.new
       @pending_keys = [] of String
@@ -96,6 +104,7 @@ module Cinderstore
 
       footer = IO::Memory.new
       footer.write_bytes(MAGIC, IO::ByteFormat::LittleEndian)
+      footer.write_byte(@checksums ? FLAG_CHECKSUMS : 0_u8)
       footer.write_bytes(index_offset.to_u64, IO::ByteFormat::LittleEndian)
       footer.write_bytes(index_length.to_u64, IO::ByteFormat::LittleEndian)
       footer.write_bytes(bloom_offset.to_u64, IO::ByteFormat::LittleEndian)
@@ -103,7 +112,11 @@ module Cinderstore
       footer.write_bytes(VERSION, IO::ByteFormat::LittleEndian)
       footer_bytes = footer.to_slice
       @io.write(footer_bytes)
-      @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
+      if @checksums
+        @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
+      else
+        @io.write_bytes(0_u32, IO::ByteFormat::LittleEndian)
+      end
       @io.flush
 
       TableMeta.new(@id, @first.not_nil!, @last.not_nil!, @count)
@@ -114,7 +127,11 @@ module Cinderstore
       offset = @io.pos
       Util.write_varint(@io, data.size.to_u64)
       @io.write(data)
-      @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
+      if @checksums
+        @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
+      else
+        @io.write_bytes(0_u32, IO::ByteFormat::LittleEndian)
+      end
       total = Util.varint_len(data.size.to_u64) + data.size + 4
       @index << BlockIndexEntry.new(@pending_keys.first, offset.to_u64, total.to_u64)
       @pending = IO::Memory.new
@@ -131,6 +148,7 @@ module Cinderstore
     @size : Int64
     @index : Array(BlockIndexEntry)
     @bloom : BloomFilter?
+    @checksums : Bool
     @closed : Bool
     @index_offset : UInt64
     @index_length : UInt64
@@ -142,6 +160,7 @@ module Cinderstore
       @size = @file.size
       @index = [] of BlockIndexEntry
       @bloom = nil
+      @checksums = true
       @closed = false
       @index_offset = 0_u64
       @index_length = 0_u64
@@ -158,6 +177,11 @@ module Cinderstore
 
     def file_id : Int64
       @file_id
+    end
+
+    # Returns whether this table's blocks carry checksums.
+    def checksums? : Bool
+      @checksums
     end
 
     def block_count : Int32
@@ -220,32 +244,52 @@ module Cinderstore
       end
       data = Bytes.new(data_len)
       @file.read_fully(data)
-      stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(data)
-      raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      if @checksums
+        stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+        actual_crc = Util.crc32(data)
+        raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      else
+        @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+      end
       data
     end
 
     private def read_footer : Nil
-      raise CorruptDataError.new("file too small: #{@path}") if @size < SstableWriter::FOOTER_SIZE
-      @file.pos = @size - SstableWriter::FOOTER_SIZE
-      footer = Bytes.new(SstableWriter::FOOTER_SIZE)
+      raise CorruptDataError.new("file too small: #{@path}") if @size < SstableWriter::FOOTER_SIZE_V1
+      # The version field sits directly before the footer CRC in both the
+      # v1 and v2 layouts, so it is always found at size - 8.
+      @file.pos = @size - 8
+      version = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+      footer_size = case version
+                    when SstableWriter::VERSION_V1 then SstableWriter::FOOTER_SIZE_V1
+                    when SstableWriter::VERSION_V2 then SstableWriter::FOOTER_SIZE_V2
+                    else
+                      raise CorruptDataError.new("unsupported version #{version} in #{@path}")
+                    end
+      raise CorruptDataError.new("file too small: #{@path}") if @size < footer_size
+
+      @file.pos = @size - footer_size
+      footer = Bytes.new(footer_size)
       @file.read_fully(footer)
 
-      crc_bytes = footer[SstableWriter::FOOTER_SIZE - 4, 4]
+      crc_bytes = footer[footer_size - 4, 4]
       stored_crc = IO::Memory.new(crc_bytes).read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(footer[0, SstableWriter::FOOTER_SIZE - 4])
-      raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      footer_body = footer[0, footer_size - 4]
+      @checksums = version == SstableWriter::VERSION_V1 ||
+                   (footer[8] & SstableWriter::FLAG_CHECKSUMS) != 0
+      if @checksums
+        actual_crc = Util.crc32(footer_body)
+        raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      end
 
       io = IO::Memory.new(footer)
       magic = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       raise CorruptDataError.new("bad magic in #{@path}") unless magic == SstableWriter::MAGIC
+      io.read_byte if version == SstableWriter::VERSION_V2
       @index_offset = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       @index_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       @bloom_offset = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       @bloom_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
-      version = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      raise CorruptDataError.new("unsupported version #{version} in #{@path}") unless version == SstableWriter::VERSION
     end
 
     private def read_index : Nil
