@@ -72,4 +72,41 @@ describe Cinderstore::Wal do
       reopened.close
     end
   end
+
+  it "round trips a checksum-free log" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append(Cinderstore::Entry.new("a", 1_i64, true, "one"))
+    writer.append(Cinderstore::Entry.new("b", 2_i64, false, ""))
+    writer.close
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64, false)
+    seq.should eq(2_i64)
+    mem.get("a").should eq("one")
+    mem.get("b").should be_nil
+    mem.get_entry("b").not_nil!.alive.should be_false
+  end
+
+  it "stops at a torn tail in a checksum-free log" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append(Cinderstore::Entry.new("alpha", 1_i64, true, "1"))
+    writer.append(Cinderstore::Entry.new("beta", 2_i64, true, "2"))
+    writer.append(Cinderstore::Entry.new("gamma", 3_i64, true, "3"))
+    writer.close
+
+    Cinderstore::SpecHelpers.truncate(path, File.size(path) - 3)
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64, false)
+    seq.should eq(2_i64)
+    mem.get("alpha").should eq("1")
+    mem.get("beta").should eq("2")
+    mem.get("gamma").should be_nil
+  end
 end

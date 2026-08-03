@@ -103,6 +103,26 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "9. Checksum-free fast mode"
+      fast_path = File.join(Dir.tempdir, "cinderstore-demo-fast")
+      FileUtils.rm_rf(fast_path) if File.exists?(fast_path)
+      fast_config = DB::Config.new
+      fast_config.sync_writes = false
+      fast_config.compact_on_flush = false
+      fast_config.checksums = false
+      fast = DB.new(fast_path, fast_config)
+      5.times { |i| fast.put("SKU-900#{i}", %({"name":"Fast Part #{i}","price":1.00,"stock":1})) }
+      fast.flush
+      fast.compact
+      puts "   write, flush, and compact with checksums disabled"
+      puts "   fast rows: #{fast.scan.size}, checksums: #{fast.checksummed?}"
+      fast.close
+      migrated = DB.new(fast_path, DB::Config.new)
+      puts "   reopen with checksums enabled, rows: #{migrated.scan.size}"
+      migrated.close
+      FileUtils.rm_rf(fast_path)
+      puts ""
       puts "Demo complete."
       0
     end

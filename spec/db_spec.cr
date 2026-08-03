@@ -229,4 +229,99 @@ describe Cinderstore::DB do
       expect_raises(Cinderstore::ClosedError) { db.put("a", "b") }
     end
   end
+
+  it "serves reads and writes with checksums disabled" do
+    config = Cinderstore::SpecHelpers.fast_config_without_checksums
+    Cinderstore::SpecHelpers.with_db("db-fast", config) do |db, _path|
+      db.checksummed?.should be_false
+      db.stats.checksums.should be_false
+      db.put("a", "1")
+      db.flush
+      db.put("b", "2")
+      db.flush
+      db.compact
+      db.get("a").should eq("1")
+      db.scan.map(&.[0]).should eq(%w[a b])
+      db.stats.tables.should eq(1)
+      db.stats.l1.should eq(1)
+    end
+  end
+
+  it "recovers a checksum-free database after restart" do
+    config = Cinderstore::SpecHelpers.fast_config_without_checksums
+    Cinderstore::SpecHelpers.with_db_path("db-fast-restart") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("a", "1")
+      db.put("b", "2")
+      db.close
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.checksummed?.should be_false
+      reopened.get("a").should eq("1")
+      reopened.get("b").should eq("2")
+      reopened.close
+    end
+  end
+
+  it "keeps a checksum-free torn log prefix after restart" do
+    config = Cinderstore::SpecHelpers.fast_config_without_checksums
+    Cinderstore::SpecHelpers.with_db_path("db-fast-torn") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("alpha", "1")
+      db.put("beta", "2")
+      db.put("gamma", "3")
+      db.close
+
+      wal = Dir.children(path).find { |n| n.ends_with?(".wal") }.not_nil!
+      Cinderstore::SpecHelpers.truncate(File.join(path, wal), File.size(File.join(path, wal)) - 3)
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.get("alpha").should eq("1")
+      reopened.get("beta").should eq("2")
+      reopened.get("gamma").should be_nil
+      reopened.close
+    end
+  end
+
+  it "migrates a checksummed database to checksum-free mode" do
+    Cinderstore::SpecHelpers.with_db_path("db-migrate-fast") do |path|
+      db = Cinderstore::DB.new(path, Cinderstore::SpecHelpers.fast_config)
+      db.put("a", "1")
+      db.put("b", "2")
+      db.flush
+      db.close
+
+      config = Cinderstore::SpecHelpers.fast_config_without_checksums
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.checksummed?.should be_false
+      reopened.get("a").should eq("1")
+      reopened.get("b").should eq("2")
+      reopened.put("c", "3")
+      reopened.compact
+      reopened.scan.map(&.[0]).should eq(%w[a b c])
+      reopened.close
+    end
+  end
+
+  it "migrates a checksum-free database to checksummed mode" do
+    config = Cinderstore::SpecHelpers.fast_config_without_checksums
+    Cinderstore::SpecHelpers.with_db_path("db-migrate-checksummed") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("a", "1")
+      db.put("b", "2")
+      db.close
+
+      reopened = Cinderstore::DB.new(path, Cinderstore::SpecHelpers.fast_config)
+      reopened.checksummed?.should be_true
+      reopened.get("a").should eq("1")
+      reopened.get("b").should eq("2")
+      reopened.close
+
+      round_trip = Cinderstore::DB.new(path, config)
+      round_trip.checksummed?.should be_false
+      round_trip.get("a").should eq("1")
+      round_trip.get("b").should eq("2")
+      round_trip.close
+    end
+  end
 end

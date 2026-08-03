@@ -27,6 +27,8 @@ module Cinderstore
     property seq : Int64 = 0_i64
     property next_id : Int64 = 1_i64
     property levels : Array(Array(TableInfo)) = [[] of TableInfo]
+    # True when the write ahead log was written with CRC32 records.
+    property checksummed : Bool = true
 
     def initialize
     end

@@ -3,22 +3,24 @@
 [![CI](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml)
 
 Cinderstore is an embeddable key and value store. It is built on a log
-structured merge tree (LSM tree). It is written in Crystal and uses only the
-Crystal standard library.
+structured merge tree (LSM tree). It is written in Crystal. It uses only
+the Crystal standard library.
 
-The store keeps a write ahead log for durability. It flushes memory to sorted
-files. It merges those files during compaction. It recovers all data after a
-restart. It serves `get`, `put`, and `delete` over a local socket.
+The store appends every write to a write ahead log. It flushes memory to
+sorted files. It merges those files during compaction. It recovers all
+data after a restart. It serves `get`, `put`, and `delete` over a local
+socket.
 
-Snapshots give you a consistent view of the store at one instant. A snapshot
-never blocks new writes. Release it when you are done.
+Snapshots give a consistent view of the store at one instant. They never
+block new writes. Release a snapshot when you are done with it.
 
-This is release 0.3.0. It adds point-in-time snapshots and consistent reads.
+This is release 0.4.0. It adds an optional checksum-free fast mode. The
+mode skips CRC32 work for faster reads and writes.
 
 ## Features
 
 - Memory table with ordered writes
-- Durable write ahead log with CRC32 framing
+- Write ahead log with CRC32 framing
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Background flush and compaction
@@ -27,6 +29,7 @@ This is release 0.3.0. It adds point-in-time snapshots and consistent reads.
 - Range scans with an iterator API
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
+- Optional checksum-free fast mode
 - Zero runtime dependencies
 
 ## Quick start
@@ -55,11 +58,11 @@ bin/cinderstore demo
 ## Demo output
 
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
-scans, flushes, compacts, deletes, snapshots, and reopens a database. The
-output is deterministic.
+scans, flushes, compacts, deletes, snapshots, and reopens a database. It
+also shows the checksum-free mode. The output is deterministic.
 
 ```text
-== Cinderstore 0.3.0 demo ==
+== Cinderstore 0.4.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -106,11 +109,19 @@ Database directory: ...\cinderstore-demo
 8. Reopen the database and verify recovery
    rows after restart: 21
 
+9. Checksum-free fast mode
+   write, flush, and compact with checksums disabled
+   fast rows: 5, checksums: false
+   reopen with checksums enabled, rows: 5
+
 Demo complete.
 ```
 
-Step 7 shows the value of a snapshot. The live store drops SKU-0001 and adds
-two products. The snapshot still sees the state before those writes.
+Step 7 shows the value of a snapshot. The live store drops SKU-0001 and
+adds two products. The snapshot still sees the state before those writes.
+
+Step 9 creates a second store with checksums disabled. The store survives
+flush, compaction, and a mode switch.
 
 ## Use the library
 
@@ -155,9 +166,9 @@ db.snapshot do |snap|
 end
 ```
 
-Iterate a snapshot with a snapshot iterator. The iterator stays valid while
-the database keeps writing. Close the iterator before you release the
-snapshot.
+Iterate a snapshot with a snapshot iterator. The iterator stays valid
+while the database keeps writing. Close the iterator before you release
+the snapshot.
 
 ```crystal
 snap = db.snapshot
@@ -183,6 +194,32 @@ Flush and compact explicitly.
 db.flush    # Move the memtable into a table.
 db.compact  # Merge tables and drop deleted keys.
 ```
+
+## Checksum-free fast mode
+
+Every data block and log record carries a CRC32. The store verifies each
+checksum when it reads data. Verification guards against silent
+corruption. It also costs CPU time.
+
+You can disable checksums. Set `checksums` to `false` in the
+configuration. The store then skips checksum work. Reads and writes run
+faster. The store accepts corruption without notice.
+
+```crystal
+config = Cinderstore::DB::Config.new
+config.checksums = false
+db = Cinderstore::DB.new("data", config)
+```
+
+The mode does not change correct behavior. Values survive a clean
+restart. A torn log tail still stops recovery at the last intact record.
+
+Use this mode only on reliable disks. Keep checksums on for critical
+data.
+
+The store records the mode in the manifest. Tables carry their own format
+version. You can switch the mode on an existing database. The store
+migrates the log on the next open. It never misreads old data.
 
 ## Command line tool
 
@@ -224,6 +261,8 @@ Start the local server.
 ```console
 bin/cinderstore server --db data --port 7654
 ```
+
+Pass `--no-checksums` to any command to skip CRC32 checks.
 
 Run `bin/cinderstore help` for the full list of commands.
 
@@ -272,43 +311,50 @@ A write goes to two places at once.
 1. Append the entry to the write ahead log.
 2. Insert the entry into the memory table.
 
-The default mode fsyncs after every write. Set `sync_writes` to `false` for
-faster, less durable writes.
+The default mode fsyncs after every write. Set `sync_writes` to `false`
+for faster, less durable writes.
 
 ### Flush
 
-When the memory table grows past its limit, the database freezes it. A new
-memory table starts. A background task writes the frozen table to a sorted
-file. The old log is deleted only after the file is durable.
+When the memory table grows past its limit, the database freezes it. A
+new memory table starts. A background task writes the frozen table to a
+sorted file. The old log is deleted only after the file is durable.
 
 ### Compaction
 
 Level-0 tables may overlap. Compaction merges every table into a fresh,
-non-overlapping level-1 set. The merge keeps the newest entry for each key.
-It drops tombstones, because it includes all data. New writes continue into
-the memory table during the merge.
+non-overlapping level-1 set. The merge keeps the newest entry for each
+key. It drops tombstones, because it includes all data. New writes
+continue into the memory table during the merge.
 
 Compaction keeps a table file on disk while a snapshot references it. The
 file is deleted only after the last snapshot releases it.
 
 ### Snapshots
 
-A snapshot is an immutable view of the store at one instant. Creation copies
-the active memory table and takes a reference to each table file.
+A snapshot is an immutable view of the store at one instant. Creation
+copies the active memory table and takes a reference to each table file.
 
-Writes, flushes, and compactions after the snapshot do not change what the
-snapshot sees. The snapshot reads the table files it holds, so compaction
-can replace those files without breaking the snapshot.
+Writes, flushes, and compactions after the snapshot do not change what
+the snapshot sees. The snapshot reads the table files it holds.
+Compaction can replace those files without breaking the snapshot.
 
-Snapshots never block writes. Reads over a snapshot use the same merge path
-as normal reads. Release a snapshot when you are done with it.
+Snapshots never block writes. Reads over a snapshot use the same merge
+path as normal reads. Release a snapshot when you are done with it.
 
 ### Read path
 
-A read merges the memory table, any frozen table, and all sorted tables. The
-merge yields the newest entry for each key. The bloom filter lets a reader
-skip a table that cannot contain the key. The block cache holds decoded
-blocks so repeated reads avoid disk.
+A read merges the memory table, any frozen table, and all sorted tables.
+The merge yields the newest entry for each key. The bloom filter lets a
+reader skip a table that cannot contain the key. The block cache holds
+decoded blocks so repeated reads avoid disk.
+
+### Checksum handling
+
+Each data block and log record carries a CRC32. The reader verifies the
+checksum when checksums are enabled. Tables carry a format version. The
+version tells the reader whether to verify. The manifest records the log
+mode. Recovery uses the recorded mode, so it never misreads a log.
 
 ### Recovery
 
@@ -326,7 +372,11 @@ Tables use a compact binary format.
 - A footer stores offsets, a version, and a CRC32.
 - Each block and each log record carries a CRC32.
 
-Sequence numbers make versions unique. They are per-write and never reused.
+Sequence numbers make versions unique. They are per-write and never
+reused.
+
+Checksum-free tables use format version 2. Version 1 tables always carry
+checksums. The reader trusts the format version, not the configuration.
 
 ## Configuration
 
@@ -339,6 +389,7 @@ config.memtable_limit = 4_i64 * 1024 * 1024
 config.bloom_fpp = 0.01
 config.cache_blocks = 512
 config.sync_writes = true
+config.checksums = true
 config.l0_compact_threshold = 4
 config.compact_on_flush = true
 db = Cinderstore::DB.new("data", config)
@@ -359,11 +410,11 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 97 examples. All pass on Windows
-and Linux. It covers the skip list, the memory table, the write ahead log,
-the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, snapshots, and the
-server protocol.
+The suite runs with `crystal spec`. It has 106 examples. All pass on
+Windows and Linux. It covers the skip list, the memory table, the write
+ahead log, the bloom filter, and the block cache. It covers the tables,
+the iterators, and the database. It covers compaction, durability,
+snapshots, checksum-free mode, and the server protocol.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs the demo, and builds the binary.
@@ -377,21 +428,14 @@ formatting, runs the suite, runs the demo, and builds the binary.
 - Compaction is a full merge. It is correct and simple, not incremental.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
+- Checksum-free mode does not detect silent corruption. Use it only on
+  reliable disks.
 
 ## Roadmap
 
-Planned:
-
-- Release 0.2: incremental compaction by level
-- Release 0.4: optional checksum-free fast mode
-- Release 0.5: batch writes and group commit
-- Release 0.6: secondary indexes
-
-Delivered:
-
-- Release 0.3: snapshot iterators and consistent reads. Snapshots give a
-  stable view of the store. Compaction keeps referenced files alive.
+See `ROADMAP.md` for the current plan.
 
 ## License
 
-Cinderstore is licensed under the Apache License 2.0. See the `LICENSE` file.
+Cinderstore is licensed under the Apache License 2.0. See the `LICENSE`
+file.

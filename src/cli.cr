@@ -39,18 +39,20 @@ module Cinderstore
       db_path = "cinderstore-data"
       host = "127.0.0.1"
       port = 7654
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--host HOST", "Bind address") { |v| host = v }
       parser.on("--port PORT", "Listen on this port") { |v| port = v.to_i }
+      parser.on("--no-checksums", "Skip CRC32 checks") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(db_path, build_config(checksums))
       server = Server.new(db, host, port)
       server.run
       db.close
@@ -61,11 +63,13 @@ module Cinderstore
       db_path = "cinderstore-data"
       key = ""
       value = ""
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--key KEY", "Key to write") { |v| key = v }
       parser.on("--value VALUE", "Value to write") { |v| value = v }
+      parser.on("--no-checksums", "Skip CRC32 checks") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
@@ -73,7 +77,7 @@ module Cinderstore
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(db_path, build_config(checksums))
       begin
         db.put(key, value)
         puts "ok"
@@ -86,10 +90,12 @@ module Cinderstore
     private def run_read(rest : Array(String)) : Int32
       db_path = "cinderstore-data"
       key = ""
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--key KEY", "Key to read") { |v| key = v }
+      parser.on("--no-checksums", "Skip CRC32 checks") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
@@ -97,7 +103,7 @@ module Cinderstore
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(db_path, build_config(checksums))
       begin
         if value = db.get(key)
           puts value
@@ -114,10 +120,12 @@ module Cinderstore
     private def run_delete(rest : Array(String)) : Int32
       db_path = "cinderstore-data"
       key = ""
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--key KEY", "Key to delete") { |v| key = v }
+      parser.on("--no-checksums", "Skip CRC32 checks") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
@@ -125,7 +133,7 @@ module Cinderstore
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(db_path, build_config(checksums))
       begin
         db.delete(key)
         puts "ok"
@@ -140,19 +148,21 @@ module Cinderstore
       start_key = ""
       finish_key = ""
       limit = -1
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--start KEY", "First key (inclusive)") { |v| start_key = v }
       parser.on("--finish KEY", "Last key (exclusive)") { |v| finish_key = v }
       parser.on("--limit N", "Maximum rows") { |v| limit = v.to_i }
+      parser.on("--no-checksums", "Skip CRC32 checks") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(db_path, build_config(checksums))
       begin
         rows = db.scan(start_key, finish_key.empty? ? nil : finish_key, limit)
         rows.each do |key, value|
@@ -166,16 +176,18 @@ module Cinderstore
 
     private def run_simple(action : String, rest : Array(String)) : Int32
       db_path = "cinderstore-data"
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
+      parser.on("--no-checksums", "Skip CRC32 checks") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(db_path, build_config(checksums))
       begin
         case action
         when "stats"
@@ -207,6 +219,12 @@ module Cinderstore
         return 0
       end
       Demo.run(db_path, fixture)
+    end
+
+    private def build_config(checksums : Bool) : DB::Config
+      config = DB::Config.new
+      config.checksums = checksums
+      config
     end
 
     private def print_help : Nil

@@ -32,6 +32,9 @@ module Cinderstore
       property l0_compact_threshold : Int32 = 4
       # Start background compaction after a flush when true.
       property compact_on_flush : Bool = true
+      # Write and verify CRC32 checksums when true. Disable for faster,
+      # less guarded reads and writes.
+      property checksums : Bool = true
     end
 
     # A snapshot of database counters for reporting.
@@ -46,13 +49,14 @@ module Cinderstore
       getter seq : Int64
       getter cache_hits : Int64
       getter cache_misses : Int64
+      getter checksums : Bool
 
       def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @entries : Int64,
                      @disk_bytes : Int64, @memtable_bytes : Int64, @wal_bytes : Int64,
-                     @seq : Int64, @cache_hits : Int64, @cache_misses : Int64)
+                     @seq : Int64, @cache_hits : Int64, @cache_misses : Int64, @checksums : Bool)
       end
 
-      def to_h : Hash(String, Int32 | Int64)
+      def to_h : Hash(String, Int32 | Int64 | Bool)
         {
           "tables"         => @tables,
           "l0"             => @l0,
@@ -64,6 +68,7 @@ module Cinderstore
           "seq"            => @seq,
           "cache_hits"     => @cache_hits,
           "cache_misses"   => @cache_misses,
+          "checksums"      => @checksums,
         }
       end
 
@@ -78,6 +83,7 @@ module Cinderstore
         io << "memtable bytes: #{@memtable_bytes}\n"
         io << "wal bytes: #{@wal_bytes}\n"
         io << "sequence: #{@seq}\n"
+        io << "checksums: #{@checksums ? "on" : "off"}\n"
         io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}"
       end
     end
@@ -172,6 +178,11 @@ module Cinderstore
 
     def path : String
       @path
+    end
+
+    # Returns true when new writes carry CRC32 checksums.
+    def checksummed? : Bool
+      @config.checksums
     end
 
     # Writes a value for `key`.
@@ -297,6 +308,7 @@ module Cinderstore
           seq: @seq,
           cache_hits: @block_cache.hits,
           cache_misses: @block_cache.misses,
+          checksums: @config.checksums,
         )
       end
     end
@@ -329,7 +341,23 @@ module Cinderstore
       load_tables(manifest)
       clean_orphans
       recover_wals
-      create_active_wal
+      migrate_log_format unless @config.checksums == manifest.checksummed
+      create_active_wal if @wal.nil?
+    end
+
+    # Switches the write ahead log to the configured checksum mode.
+    #
+    # Old logs are replayed in the recorded mode. When the mode changes we
+    # flush the recovered data into tables first. Tables carry their own
+    # format version, so the switch never misreads data. Then we delete the
+    # old logs and record the new mode.
+    private def migrate_log_format : Nil
+      @manifest.not_nil!.checksummed = @config.checksums
+      if @mem.empty?
+        save_manifest
+      else
+        do_flush
+      end
     end
 
     private def load_tables(manifest : Manifest) : Nil
@@ -357,9 +385,10 @@ module Cinderstore
 
     private def recover_wals : Nil
       files = Dir.children(@path).select { |name| name.ends_with?(WAL_SUFFIX) }.sort
+      verify = @manifest.not_nil!.checksummed
       files.each do |name|
         full = File.join(@path, name)
-        @seq = Wal.recover(full, @mem, @seq)
+        @seq = Wal.recover(full, @mem, @seq, verify)
       end
       # The memtable now holds what the logs held. Keep the logs so that a
       # crash before the next flush does not lose data. Empty logs carry no
@@ -374,7 +403,7 @@ module Cinderstore
     private def create_active_wal : Nil
       id = @next_id
       @next_id += 1
-      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes)
+      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes, @config.checksums)
     end
 
     # ------------------------------------------------------------------
@@ -429,7 +458,7 @@ module Cinderstore
           @next_id += 1
           wal_id = @next_id
           @next_id += 1
-          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes)
+          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes, @config.checksums)
         end
       end
 
@@ -459,7 +488,7 @@ module Cinderstore
       final_path = table_path(table_id)
       meta = nil
       File.open(tmp_path, "w") do |io|
-        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp)
+        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         mem.each_entry do |entry|
           writer.add(entry.key, entry.value, entry.seq, entry.alive)
         end
@@ -557,7 +586,7 @@ module Cinderstore
             id
           end
           io = File.open(File.join(@path, "#{Util.file_stem(current_id)}#{TMP_SUFFIX}"), "w")
-          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp)
+          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         end
         writer.not_nil!.add(entry.key, entry.value, entry.seq, true)
         written += 1

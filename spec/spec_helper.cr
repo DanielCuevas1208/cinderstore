@@ -45,6 +45,13 @@ module Cinderstore
       config
     end
 
+    # Returns a fast config with checksums disabled.
+    def self.fast_config_without_checksums : DB::Config
+      config = fast_config
+      config.checksums = false
+      config
+    end
+
     # Returns a config tuned for small flushes and tiny tables.
     def self.small_config(block_size : Int32 = 256, memtable_limit : Int64 = 4096) : DB::Config
       config = fast_config
