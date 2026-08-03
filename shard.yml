@@ -1,0 +1,11 @@
+name: cinderstore
+version: 0.1.0
+description: An embeddable key/value store built on a log structured merge tree.
+crystal: ">= 1.10.0"
+license: Apache-2.0
+authors:
+  - Cinderstore Contributors
+
+targets:
+  cinderstore:
+    main: src/cli.cr

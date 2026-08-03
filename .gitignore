@@ -1,0 +1,34 @@
+# Crystal build artifacts
+/bin/
+/lib/
+/.shards/
+
+# Crystal
+*.dwarf
+*.dwarf.*
+*.o
+*.obj
+*.class
+*.so
+*.dylib
+*.dll
+
+# Test coverage
+/coverage/
+
+# Local database directories
+/.cinderstore/
+/data/
+*.sst
+*.wal
+
+# Temporary and scratch files
+/tmp/
+*.tmp
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

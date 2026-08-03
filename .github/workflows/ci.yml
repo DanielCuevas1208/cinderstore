@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Crystal
+        uses: crystal-lang/setup-crystal@v2
+        with:
+          crystal: 1.21.0
+
+      # Cinderstore has no dependencies. `shards install` is not needed,
+      # and it requires symlink support on Windows.
+
+      - name: Check formatting
+        run: crystal tool format --check
+
+      - name: Run the test suite
+        run: crystal spec
+
+      - name: Build the binary
+        run: shards build --production
