@@ -95,9 +95,43 @@ module Cinderstore
       snap.release
       puts ""
 
+      puts "8. Compaction cascades data through the levels"
+      level_path = File.join(Dir.tempdir, "cinderstore-levels-demo")
+      FileUtils.rm_rf(level_path) if File.exists?(level_path)
+      level_config = DB::Config.new
+      level_config.sync_writes = false
+      level_config.compact_on_flush = false
+      level_config.l0_compact_threshold = 2
+      level_config.max_bytes_per_level = 1536
+      level_config.block_size = 128
+      level_db = DB.new(level_path, level_config)
+      3.times do |batch|
+        20.times do |i|
+          id = batch * 20 + i
+          level_db.put("prod-%03d" % id, %({"batch":#{batch},"sku":"prod-#{id}"}))
+        end
+        level_db.flush
+      end
+      puts "   3 flushes of 20 rows each sit in level 0"
+      puts "   #{level_db.stats.to_s.lines.first}"
+      level_db.compact
+      puts "   one compact moves every row down into level 2"
+      puts "   #{level_db.stats.to_s.lines.first}, rows: #{level_db.scan.size}"
+      20.times do |i|
+        id = 60 + i
+        level_db.put("prod-%03d" % id, %({"batch":3,"sku":"prod-#{id}"}))
+      end
+      level_db.flush
+      level_db.compact
+      puts "   a fourth batch compacts into level 1 only"
+      puts "   #{level_db.stats.to_s.lines.first}, rows: #{level_db.scan.size}"
+      puts "   level 2 keeps its tables, so no table above it is rewritten"
+      level_db.close
+      puts ""
+
       db.close
 
-      puts "8. Reopen the database and verify recovery"
+      puts "9. Reopen the database and verify recovery"
       reopened = DB.new(path, config)
       count = reopened.scan.size
       puts "   rows after restart: #{count}"

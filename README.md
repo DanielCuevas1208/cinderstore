@@ -13,7 +13,9 @@ restart. It serves `get`, `put`, and `delete` over a local socket.
 Snapshots give you a consistent view of the store at one instant. A snapshot
 never blocks new writes. Release it when you are done.
 
-This is release 0.3.0. It adds point-in-time snapshots and consistent reads.
+This is release 0.4.0. It adds incremental compaction by level. A merge
+now rewrites only the tables it touches, and oversized levels cascade into
+the next level.
 
 ## Features
 
@@ -22,6 +24,7 @@ This is release 0.3.0. It adds point-in-time snapshots and consistent reads.
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Background flush and compaction
+- Incremental compaction that merges one level at a time
 - Point-in-time snapshots with consistent reads
 - Snapshot iterators that stay valid during writes
 - Range scans with an iterator API
@@ -59,7 +62,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. The
 output is deterministic.
 
 ```text
-== Cinderstore 0.3.0 demo ==
+== Cinderstore 0.4.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -103,7 +106,16 @@ Database directory: ...\cinderstore-demo
    snapshot iterator SKU-0010 to SKU-0016
    SKU-0010, SKU-0011, SKU-0013, SKU-0014, SKU-0015
 
-8. Reopen the database and verify recovery
+8. Compaction cascades data through the levels
+   3 flushes of 20 rows each sit in level 0
+   tables: 3 (l0: 3, l1: 0)
+   one compact moves every row down into level 2
+   tables: 1 (l0: 0, l1: 0, l2: 1), rows: 60
+   a fourth batch compacts into level 1 only
+   tables: 2 (l0: 0, l1: 1, l2: 1), rows: 80
+   level 2 keeps its tables, so no table above it is rewritten
+
+9. Reopen the database and verify recovery
    rows after restart: 21
 
 Demo complete.
@@ -111,6 +123,9 @@ Demo complete.
 
 Step 7 shows the value of a snapshot. The live store drops SKU-0001 and adds
 two products. The snapshot still sees the state before those writes.
+
+Step 8 shows leveled compaction. Data moves down one level at a time.
+Compaction rewrites only the levels it touches.
 
 ## Use the library
 
@@ -283,10 +298,17 @@ file. The old log is deleted only after the file is durable.
 
 ### Compaction
 
-Level-0 tables may overlap. Compaction merges every table into a fresh,
-non-overlapping level-1 set. The merge keeps the newest entry for each key.
-It drops tombstones, because it includes all data. New writes continue into
-the memory table during the merge.
+Level-0 tables may overlap. Levels 1 and deeper hold non-overlapping
+tables. Compaction works one level at a time.
+
+When level 0 crosses its threshold, a merge pushes its tables into level 1.
+The merge keeps the newest entry for each key. It rewrites only the tables
+that overlap the merged range. Non-overlapping level-1 tables stay on disk.
+
+A level that exceeds its byte target cascades into the next level. Deeper
+levels hold about ten times more data. A tombstone survives a merge when a
+deeper level may still hold older data. It drops only when the merge reaches
+the deepest level.
 
 Compaction keeps a table file on disk while a snapshot references it. The
 file is deleted only after the last snapshot releases it.
@@ -341,8 +363,16 @@ config.cache_blocks = 512
 config.sync_writes = true
 config.l0_compact_threshold = 4
 config.compact_on_flush = true
+config.max_bytes_per_level = 8 * 1024 * 1024
+config.level_size_ratio = 10
+config.max_levels = 7
 db = Cinderstore::DB.new("data", config)
 ```
+
+`max_bytes_per_level` sets the size target for level 1.
+`level_size_ratio` scales each deeper level.
+`max_levels` bounds the number of levels.
+The deepest level has no size target.
 
 ## Project layout
 
@@ -359,14 +389,15 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 97 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 104 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, snapshots, and the
-server protocol.
+and the database. It covers compaction, leveled compaction, durability,
+snapshots, and the server protocol.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
-formatting, runs the suite, runs the demo, and builds the binary.
+formatting, runs the suite, runs the demo and the server demo, and builds
+the binary.
 
 ## Limitations
 
@@ -374,7 +405,7 @@ formatting, runs the suite, runs the demo, and builds the binary.
 - Values are limited to 4 MB.
 - Keys are limited to 4 KB.
 - The server protocol is unencrypted. Use it on localhost only.
-- Compaction is a full merge. It is correct and simple, not incremental.
+- Compaction merges a whole level, not a single key range.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
 
@@ -382,15 +413,16 @@ formatting, runs the suite, runs the demo, and builds the binary.
 
 Planned:
 
-- Release 0.2: incremental compaction by level
-- Release 0.4: optional checksum-free fast mode
-- Release 0.5: batch writes and group commit
-- Release 0.6: secondary indexes
+- Release 0.5: optional checksum-free fast mode
+- Release 0.6: batch writes and group commit
+- Release 0.7: secondary indexes
 
 Delivered:
 
 - Release 0.3: snapshot iterators and consistent reads. Snapshots give a
   stable view of the store. Compaction keeps referenced files alive.
+- Release 0.4: incremental compaction by level. Compaction merges one level
+  at a time. Oversized levels cascade into the next level.
 
 ## License
 
