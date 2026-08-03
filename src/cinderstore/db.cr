@@ -91,6 +91,8 @@ module Cinderstore
       getter path : String
 
       @reader : SstableReader?
+      @refs : Int32 = 1
+      @orphaned : Bool = false
 
       def initialize(@id : Int64, @first : String, @last : String, @count : Int64, @path : String)
       end
@@ -103,6 +105,35 @@ module Cinderstore
           @reader = r
         end
         r
+      end
+
+      # Takes one extra reference. Snapshots use this to keep the table file
+      # alive while they read it.
+      def retain : Nil
+        @refs += 1
+      end
+
+      # Drops one reference. The reader closes and the file is deleted when
+      # the last reference leaves and the table no longer belongs to the
+      # database.
+      def release : Nil
+        @refs -= 1
+        if @refs <= 0
+          close
+          if @orphaned
+            File.delete(@path) if File.exists?(@path)
+          end
+        end
+      end
+
+      # Marks the table as removed from the database. Its file is deleted
+      # once every reference, including snapshot references, is released.
+      def orphan : Nil
+        @orphaned = true
+      end
+
+      def orphaned? : Bool
+        @orphaned
       end
 
       def close : Nil
@@ -172,10 +203,10 @@ module Cinderstore
       validate_key(key)
       @lock.synchronize do
         check_open
-        if entry = @frozen.try { |m| m.get_entry(key) }
+        if entry = @mem.get_entry(key)
           return entry.alive ? entry.value : nil
         end
-        if entry = @mem.get_entry(key)
+        if entry = @frozen.try { |m| m.get_entry(key) }
           return entry.alive ? entry.value : nil
         end
         iter = LiveIter.new(make_merge_iter(key, true))
@@ -216,6 +247,31 @@ module Cinderstore
     def compact : Nil
       @flush_lock.synchronize do
         do_compact
+      end
+    end
+
+    # Returns an immutable view of the store at this instant.
+    #
+    # A snapshot copies the active memory table and keeps the table files it
+    # references alive. Later writes, flushes, and compactions do not change
+    # what the snapshot sees. Release the snapshot with `release` when you
+    # are done with it.
+    def snapshot : Snapshot
+      @lock.synchronize do
+        check_open
+        tables = @levels.map { |level| level.dup }
+        Snapshot.new(@seq, @mem.dup, @frozen, tables, @config.cache_blocks)
+      end
+    end
+
+    # Returns an immutable view of the store, then releases it after the
+    # block finishes.
+    def snapshot(& : Snapshot ->) : Nil
+      snap = snapshot
+      begin
+        yield snap
+      ensure
+        snap.release
       end
     end
 
@@ -456,12 +512,13 @@ module Cinderstore
       outputs = merge_tables(tables.not_nil!)
 
       @lock.synchronize do
-        @levels.flatten.each(&.close)
         @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }]
         save_manifest
         tables.not_nil!.each do |ref|
-          path = ref.path
-          File.delete(path) if File.exists?(path)
+          # Mark the table as gone, then drop the database reference. The
+          # file stays on disk until every snapshot reference is released.
+          ref.orphan
+          ref.release
         end
       end
     end

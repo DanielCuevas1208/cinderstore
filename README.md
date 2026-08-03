@@ -1,7 +1,6 @@
 # Cinderstore
 
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
-<!-- Replace <owner>/<repo> with your repository path. -->
+[![CI](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml)
 
 Cinderstore is an embeddable key and value store. It is built on a log
 structured merge tree (LSM tree). It is written in Crystal and uses only the
@@ -11,7 +10,10 @@ The store keeps a write ahead log for durability. It flushes memory to sorted
 files. It merges those files during compaction. It recovers all data after a
 restart. It serves `get`, `put`, and `delete` over a local socket.
 
-This is release 0.1.0. It is the first coherent release.
+Snapshots give you a consistent view of the store at one instant. A snapshot
+never blocks new writes. Release it when you are done.
+
+This is release 0.3.0. It adds point-in-time snapshots and consistent reads.
 
 ## Features
 
@@ -20,6 +22,8 @@ This is release 0.1.0. It is the first coherent release.
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Background flush and compaction
+- Point-in-time snapshots with consistent reads
+- Snapshot iterators that stay valid during writes
 - Range scans with an iterator API
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
@@ -51,11 +55,11 @@ bin/cinderstore demo
 ## Demo output
 
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
-scans, flushes, compacts, deletes, and reopens a database. The output is
-deterministic.
+scans, flushes, compacts, deletes, snapshots, and reopens a database. The
+output is deterministic.
 
 ```text
-== Cinderstore 0.1.0 demo ==
+== Cinderstore 0.3.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -78,21 +82,35 @@ Database directory: ...\cinderstore-demo
 4. Delete 4 products, update 2 products, then flush again
    tables: 2 (l0: 2, l1: 0), entries: 30
    disk bytes: 1902, memtable bytes: 0
+   The deleted keys still occupy space in the level-0 tables.
 
 5. Compact merges the tables and drops the deleted keys
    tables: 1 (l0: 0, l1: 1), entries: 20
    disk bytes: 1384, memtable bytes: 0
+   The store keeps the newest value for each key.
 
 6. Verify deletes and updates after compaction
    get SKU-0003 => nil
-   get SKU-0001 => {"name":"Forge Anvil 45kg","price":175.00,"stock":14}
+   get SKU-0001 => "{\"name\":\"Forge Anvil 45kg\",\"price\":175.00,\"stock\":14}"
    scan count   => 20
 
-7. Reopen the database and verify recovery
-   rows after restart: 20
+7. Snapshot the store for a consistent read
+   snapshot rows at creation: 20
+   after 2 new writes and 1 delete, then a flush
+   live rows: 21, snapshot rows: 20
+   live SKU-0001    => nil
+   snapshot SKU-0001 => "{\"name\":\"Forge Anvil 45kg\",\"price\":175.00,\"stock\":14}"
+   snapshot iterator SKU-0010 to SKU-0016
+   SKU-0010, SKU-0011, SKU-0013, SKU-0014, SKU-0015
+
+8. Reopen the database and verify recovery
+   rows after restart: 21
 
 Demo complete.
 ```
+
+Step 7 shows the value of a snapshot. The live store drops SKU-0001 and adds
+two products. The snapshot still sees the state before those writes.
 
 ## Use the library
 
@@ -113,6 +131,42 @@ db.scan("a", "z").each do |key, value|
   puts "#{key} => #{value}"
 end
 db.close
+```
+
+### Read a snapshot
+
+A snapshot is a consistent view at one instant. Take a snapshot, read it,
+then release it.
+
+```crystal
+snap = db.snapshot
+snap.get("forge-hammer") # => "steel"
+snap.scan("a", "z").each do |key, value|
+  puts "#{key} => #{value}"
+end
+snap.release
+```
+
+The block form releases the snapshot automatically.
+
+```crystal
+db.snapshot do |snap|
+  count = snap.count
+end
+```
+
+Iterate a snapshot with a snapshot iterator. The iterator stays valid while
+the database keeps writing. Close the iterator before you release the
+snapshot.
+
+```crystal
+snap = db.snapshot
+iter = snap.iter("SKU-0100")
+while entry = iter.next?
+  process(entry.key, entry.value)
+end
+iter.close
+snap.release
 ```
 
 Iterate a range with a block.
@@ -234,6 +288,21 @@ non-overlapping level-1 set. The merge keeps the newest entry for each key.
 It drops tombstones, because it includes all data. New writes continue into
 the memory table during the merge.
 
+Compaction keeps a table file on disk while a snapshot references it. The
+file is deleted only after the last snapshot releases it.
+
+### Snapshots
+
+A snapshot is an immutable view of the store at one instant. Creation copies
+the active memory table and takes a reference to each table file.
+
+Writes, flushes, and compactions after the snapshot do not change what the
+snapshot sees. The snapshot reads the table files it holds, so compaction
+can replace those files without breaking the snapshot.
+
+Snapshots never block writes. Reads over a snapshot use the same merge path
+as normal reads. Release a snapshot when you are done with it.
+
 ### Read path
 
 A read merges the memory table, any frozen table, and all sorted tables. The
@@ -280,6 +349,7 @@ db = Cinderstore::DB.new("data", config)
 ```text
 src/cinderstore.cr       Library entry point
 src/cinderstore/         Core components
+src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
 examples/server_demo.cr  Wire protocol walkthrough
@@ -289,13 +359,14 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 82 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 97 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, and the server protocol.
+and the database. It covers compaction, durability, snapshots, and the
+server protocol.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
-formatting, runs the suite, and builds the binary.
+formatting, runs the suite, runs the demo, and builds the binary.
 
 ## Limitations
 
@@ -305,14 +376,21 @@ formatting, runs the suite, and builds the binary.
 - The server protocol is unencrypted. Use it on localhost only.
 - Compaction is a full merge. It is correct and simple, not incremental.
 - No multi-threaded runtime is required. The server uses fibers.
+- Release snapshots before you close the database.
 
 ## Roadmap
 
+Planned:
+
 - Release 0.2: incremental compaction by level
-- Release 0.3: snapshot iterators and consistent reads
 - Release 0.4: optional checksum-free fast mode
 - Release 0.5: batch writes and group commit
 - Release 0.6: secondary indexes
+
+Delivered:
+
+- Release 0.3: snapshot iterators and consistent reads. Snapshots give a
+  stable view of the store. Compaction keeps referenced files alive.
 
 ## License
 

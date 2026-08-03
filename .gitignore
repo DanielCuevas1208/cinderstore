@@ -19,6 +19,7 @@
 # Local database directories
 /.cinderstore/
 /data/
+/cinderstore-data/
 *.sst
 *.wal
 

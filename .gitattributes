@@ -1,0 +1,6 @@
+# Keep every text file on LF line endings.
+#
+# The formatter check `crystal tool format --check` treats CRLF files as
+# changed. Without this file, a Windows checkout fails the check. The rule
+# below forces LF on every platform.
+* text=auto eol=lf
