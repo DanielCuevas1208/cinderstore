@@ -287,6 +287,47 @@ module Cinderstore
       end
     end
 
+    # Returns a streaming iterator over the primary keys that map to
+    # `index_key` in `index`.
+    #
+    # The iterator reads a snapshot taken at creation, so it stays
+    # consistent while the store keeps writing. Keys come back in primary
+    # key order. The iterator owns its snapshot, so call `close` when you
+    # are done; that releases the snapshot.
+    def query_iter(index : String, index_key : String) : IndexIter
+      validate_index_name(index)
+      snap = snapshot
+      begin
+        iter = snap.query_iter(index, index_key)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
+      end
+    end
+
+    # Returns a streaming iterator over the primary keys whose index key
+    # lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. The iterator reads a snapshot
+    # taken at creation, so it stays consistent while the store keeps
+    # writing. The iterator owns its snapshot, so call `close` when you are
+    # done; that releases the snapshot.
+    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil) : IndexIter
+      validate_index_name(index)
+      snap = snapshot
+      begin
+        iter = snap.query_range_iter(index, start_key, finish_key)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
+      end
+    end
+
     # Writes a value for `key`.
     def put(key : String, value : String) : Nil
       validate_key(key)

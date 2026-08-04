@@ -125,6 +125,40 @@ module Cinderstore
       end
     end
 
+    # Returns a streaming iterator over the primary keys that map to
+    # `index_key` in `index`.
+    #
+    # The result reflects the state the snapshot holds. The iterator shares
+    # the snapshot, so it stays consistent while the database keeps writing.
+    # Keys come back in primary key order. Close the iterator before you
+    # release the snapshot. Closing the iterator never releases the snapshot.
+    def query_iter(index : String, index_key : String) : IndexIter
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.exact_prefix(index, index_key)
+        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(prefix, false)), prefix, nil)
+      end
+    end
+
+    # Returns a streaming iterator over the primary keys whose index key
+    # lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. The iterator shares the snapshot,
+    # so it stays consistent while the database keeps writing. Close the
+    # iterator before you release the snapshot. Closing the iterator never
+    # releases the snapshot.
+    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil) : IndexIter
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.name_prefix(index)
+        start = "#{prefix}#{start_key}#{Index::SEP}"
+        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(start, false)), prefix, finish_key)
+      end
+    end
+
     # Returns the number of live entries the snapshot sees. The count never
     # changes after creation.
     def count : Int64

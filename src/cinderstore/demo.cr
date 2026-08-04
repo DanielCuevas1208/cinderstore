@@ -218,6 +218,31 @@ module Cinderstore
       index_db.compact
       puts "   delete SKU-0011, then flush and compact"
       puts "   query by-name \"Coal Shovel Small\" => #{format_keys(index_db.query("by-name", "Coal Shovel Small"))}"
+      puts ""
+
+      puts "13. Streaming iterators for secondary index queries"
+      streamed = [] of String
+      iter = index_db.query_iter("by-price", "15.5")
+      while key = iter.next?
+        streamed << key
+      end
+      iter.close
+      puts "   streamed by-price \"15.5\"            => #{format_keys(streamed)}"
+      taken = [] of String
+      qiter = index_db.query_range_iter("by-stock", "20", "30")
+      while key = qiter.next?
+        taken << key
+        break if taken.size >= 3
+      end
+      qiter.close
+      puts "   stock range 20 to 30, first 3        => #{format_keys(taken)}"
+      snap = index_db.snapshot
+      index_db.delete("SKU-0012")
+      siter = snap.query_iter("by-name", "Ember Tray Brass")
+      puts "   snapshot stream \"Ember Tray Brass\"  => #{format_keys(siter.to_a)}"
+      siter.close
+      puts "   live query after the delete          => #{format_keys(index_db.query("by-name", "Ember Tray Brass"))}"
+      snap.release
       index_db.close
       reopened = DB.new(index_path)
       puts "   reopen and query by-stock \"31\"    => #{format_keys(reopened.query("by-stock", "31"))}"

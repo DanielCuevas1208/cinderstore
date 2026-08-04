@@ -17,9 +17,14 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.7.0. It adds secondary indexes. An index writes into a
-reserved part of the log structured merge tree. The write ahead log keeps
-the index atomic with the data. Compaction drops stale index entries.
+This is release 0.8.0. It adds streaming iterators for secondary index
+queries. A query iterator reads a snapshot. It yields primary keys one at
+a time. You can stop early and close it. The server streams query results
+over the socket too.
+
+Release 0.7 added secondary indexes. An index writes into a reserved part
+of the log structured merge tree. The write ahead log keeps the index
+atomic with the data. Compaction drops stale index entries.
 
 ## Features
 
@@ -38,6 +43,7 @@ the index atomic with the data. Compaction drops stale index entries.
 - Secondary indexes with automatic maintenance
 - JSON field indexes with one API call
 - Exact and range queries over an index
+- Streaming iterators for exact and range index queries
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
 - Zero runtime dependencies
@@ -78,7 +84,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates secondary indexes and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.7.0 demo ==
+== Cinderstore 0.8.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -154,6 +160,12 @@ Database directory: ...\cinderstore-demo
    query by-price "15.5"            => SKU-0010
    delete SKU-0011, then flush and compact
    query by-name "Coal Shovel Small" => (none)
+
+13. Streaming iterators for secondary index queries
+   streamed by-price "15.5"            => SKU-0010
+   stock range 20 to 30, first 3        => SKU-0004, SKU-0023, SKU-0003
+   snapshot stream "Ember Tray Brass"  => SKU-0012
+   live query after the delete          => (none)
    reopen and query by-stock "31"    => SKU-0010
 
 Demo complete.
@@ -179,6 +191,11 @@ every row after a restart.
 Step 12 shows the value of secondary indexes. Three JSON indexes cover the
 catalog. A price update moves SKU-0010 between index keys. A delete removes
 SKU-0011 from its indexes. The store recovers every index after a restart.
+
+Step 13 shows the value of streaming iterators. An exact query streams its
+matches one at a time. A range query stops early after three rows. A
+snapshot stream still sees SKU-0012 after a delete removes it. The store
+recovers the index after a restart.
 
 ## Use the library
 
@@ -317,6 +334,43 @@ A query reads the stored index entries. It works without a registered
 index in the current process. Index keys sort by byte value, like primary
 keys.
 
+### Stream the matches of a query
+
+Stream the matches of an exact query. Each call to `next?` returns the
+next primary key. Call `close` when you are done.
+
+```crystal
+iter = db.query_iter("by-price", "15.5")
+while key = iter.next?
+  process(key)
+end
+iter.close
+```
+
+The iterator reads a snapshot it owns. It stays consistent while the store
+keeps writing. Closing it releases the snapshot.
+
+Stream a range the same way. The range is `[start, finish)`.
+
+```crystal
+iter = db.query_range_iter("by-stock", "20", "30")
+iter.each { |key| process(key) }
+iter.close
+```
+
+A snapshot exposes the same iterators. Close a snapshot iterator before
+you release the snapshot. Closing it never releases the snapshot.
+
+```crystal
+db.snapshot do |snap|
+  snap.query_iter("by-name", "Ash Rake Forged").each { |key| process(key) }
+  snap.query_range_iter("by-price", "10", "20").each { |key| process(key) }
+end
+```
+
+Streaming avoids building a result array. A large query keeps a small
+memory footprint. You can stop reading at any time.
+
 Flush and compact explicitly.
 
 ```crystal
@@ -431,7 +485,8 @@ The server answers with one line per command.
 
 A `QUERY` command returns the primary keys behind one index key. A
 `QUERYRANGE` command returns the primary keys behind a range of index keys.
-Both commands end with `END`.
+Both commands stream their rows. The server writes one `ROW` line as it
+produces each key, then writes `END`.
 
 Use a tool such as `nc` or the included example client.
 
@@ -602,6 +657,7 @@ src/cinderstore/         Core components
 src/cinderstore/batch.cr Atomic batch writes
 src/cinderstore/commit_group.cr  Shared durability syncs
 src/cinderstore/index.cr Secondary index namespace
+src/cinderstore/index_query.cr  Streaming index query iterators
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
@@ -612,13 +668,14 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 172 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 187 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
 and the database. It covers batch writes, group commit, compaction by level,
 durability, snapshots, and the server protocol. It covers both checksum
 modes and the legacy file layouts. It covers secondary index maintenance,
-queries, recovery, and snapshots.
+queries, recovery, and snapshots. It covers streaming index query iterators
+on databases, snapshots, and the server.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -641,15 +698,19 @@ formatting, runs the suite, runs both demos, and builds the binary.
   large merge. The level targets keep that merge rare.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
+- A database-level query iterator holds a snapshot until you close it.
 
 ## Roadmap
 
 Planned:
 
-- Release 0.8: streaming iterators for secondary index queries
+- Release 0.9: streaming iterators for primary key range scans
 
 Delivered:
 
+- Release 0.8: streaming iterators for secondary index queries. A query
+  iterator reads a snapshot and yields primary keys one at a time. The
+  server streams query results over the socket.
 - Release 0.7: secondary indexes. Index entries share the log structured
   merge tree. The store maintains each index on every write. Queries return
   the primary keys behind an index key.

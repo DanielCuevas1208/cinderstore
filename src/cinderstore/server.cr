@@ -59,10 +59,14 @@ module Cinderstore
           next if line.empty?
           begin
             command = parse_command(line)
-            response = execute(command)
             shutdown = true if command.op == "SHUTDOWN"
-            client << response << "\n"
-            client.flush
+            if command.op == "QUERY" || command.op == "QUERYRANGE"
+              stream_index_query(client, command)
+            else
+              response = execute(command)
+              client << response << "\n"
+              client.flush
+            end
           rescue ex : Error
             client << "ERR #{ex.message}\n"
             client.flush
@@ -134,12 +138,6 @@ module Cinderstore
             s << "END"
           end
         end
-      when "QUERY"
-        rows = @db.query(command.key, command.value.not_nil!)
-        format_index_rows(rows)
-      when "QUERYRANGE"
-        rows = @db.query_range(command.key, command.start, command.finish)
-        format_index_rows(rows)
       when "STATS"
         "STATS #{@db.stats.to_json}"
       when "PING"
@@ -158,17 +156,24 @@ module Cinderstore
       end
     end
 
-    # Formats a query result as one ROW line per primary key, then END.
-    private def format_index_rows(rows : Array(String)) : String
-      if rows.empty?
-        "END"
-      else
-        String.build do |s|
-          rows.each do |key|
-            s << "ROW #{key}\n"
-          end
-          s << "END"
+    # Streams a query result as one ROW line per primary key, then END.
+    #
+    # The server never materializes the result. Each row is flushed as the
+    # iterator produces it, so a large result keeps a small memory footprint.
+    private def stream_index_query(client : TCPSocket, command : Command) : Nil
+      iter = if command.op == "QUERY"
+               @db.query_iter(command.key, command.value.not_nil!)
+             else
+               @db.query_range_iter(command.key, command.start, command.finish)
+             end
+      begin
+        while key = iter.next?
+          client << "ROW #{key}\n"
+          client.flush
         end
+        client << "END\n"
+      ensure
+        iter.close
       end
     end
   end

@@ -200,12 +200,18 @@ module Cinderstore
       raise Error.new("missing --index") if index.empty?
       db = DB.new(db_path)
       begin
-        rows = if key.empty?
-                 db.query_range(index, start_key, finish_key.empty? ? nil : finish_key, limit)
+        iter = if key.empty?
+                 db.query_range_iter(index, start_key, finish_key.empty? ? nil : finish_key)
                else
-                 db.query(index, key, limit)
+                 db.query_iter(index, key)
                end
-        rows.each { |pk| puts pk }
+        count = 0
+        while pk = iter.next?
+          puts pk
+          count += 1
+          break if limit >= 0 && count >= limit
+        end
+        iter.close
       ensure
         db.close
       end

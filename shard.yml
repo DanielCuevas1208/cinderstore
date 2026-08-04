@@ -1,5 +1,5 @@
 name: cinderstore
-version: 0.7.0
+version: 0.8.0
 description: An embeddable key/value store built on a log structured merge tree.
 crystal: ">= 1.21.0"
 license: Apache-2.0
