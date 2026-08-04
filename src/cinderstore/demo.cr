@@ -5,12 +5,13 @@ module Cinderstore
   #
   # The demo loads a small product catalog, writes it, scans a range,
   # flushes, compacts, and verifies recovery. Its output is deterministic.
+  # Set `checksums` to false to run the walkthrough in fast mode.
   class Demo
-    def self.run(db_path : String? = nil, fixture : String? = nil) : Int32
-      new(db_path, fixture).run
+    def self.run(db_path : String? = nil, fixture : String? = nil, checksums : Bool = true) : Int32
+      new(db_path, fixture, checksums).run
     end
 
-    def initialize(@db_path : String? = nil, @fixture : String? = nil)
+    def initialize(@db_path : String? = nil, @fixture : String? = nil, @checksums : Bool = true)
     end
 
     def run : Int32
@@ -25,6 +26,7 @@ module Cinderstore
       config = DB::Config.new
       config.sync_writes = false
       config.compact_on_flush = false
+      config.checksums = @checksums
       db = DB.new(path, config)
 
       puts "== Cinderstore #{VERSION} demo =="
@@ -86,12 +88,12 @@ module Cinderstore
       puts "   live SKU-0001    => #{db.get("SKU-0001").inspect}"
       puts "   snapshot SKU-0001 => #{snap.get("SKU-0001").inspect}"
       puts "   snapshot iterator SKU-0010 to SKU-0016"
-      rows = [] of String
+      keys = [] of String
       iter = snap.iter("SKU-0010")
       while (entry = iter.next?) && entry.key < "SKU-0016"
-        rows << entry.key
+        keys << entry.key
       end
-      puts "   #{rows.join(", ")}"
+      puts "   #{keys.join(", ")}"
       snap.release
       puts ""
 
@@ -103,6 +105,45 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "9. Fast mode skips checksums"
+      ref_config = DB::Config.new
+      ref_config.sync_writes = false
+      ref_config.compact_on_flush = false
+      ref_config.checksums = true
+      fast_config = DB::Config.new
+      fast_config.sync_writes = false
+      fast_config.compact_on_flush = false
+      fast_config.checksums = false
+      ref_path = "#{path}-ref"
+      fast_path = "#{path}-fast"
+      FileUtils.rm_rf(ref_path) if File.exists?(ref_path)
+      FileUtils.rm_rf(fast_path) if File.exists?(fast_path)
+      ref_db = DB.new(ref_path, ref_config)
+      fast_db = DB.new(fast_path, fast_config)
+      rows.each do |sku, name, price, stock|
+        value = %({"name":"#{name}","price":#{price},"stock":#{stock}})
+        ref_db.put(sku, value)
+        fast_db.put(sku, value)
+      end
+      ref_db.flush
+      fast_db.flush
+      puts "   checksummed disk bytes: #{ref_db.stats.disk_bytes}"
+      puts "   fast disk bytes:        #{fast_db.stats.disk_bytes}"
+      puts "   fast mode saves #{ref_db.stats.disk_bytes - fast_db.stats.disk_bytes} bytes on disk"
+      puts "   fast mode scan count: #{fast_db.scan.size}"
+      snap = fast_db.snapshot
+      puts "   fast mode snapshot rows: #{snap.count}"
+      snap.release
+      ref_db.close
+      fast_db.close
+      fast_reopened = DB.new(fast_path, fast_config)
+      puts "   fast mode rows after restart: #{fast_reopened.scan.size}"
+      fast_reopened.close
+      FileUtils.rm_rf(ref_path) rescue nil
+      FileUtils.rm_rf(fast_path) rescue nil
+      puts ""
+
       puts "Demo complete."
       0
     end

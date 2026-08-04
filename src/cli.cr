@@ -39,18 +39,20 @@ module Cinderstore
       db_path = "cinderstore-data"
       host = "127.0.0.1"
       port = 7654
+      no_checksums = false
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--host HOST", "Bind address") { |v| host = v }
       parser.on("--port PORT", "Listen on this port") { |v| port = v.to_i }
+      parser.on("--no-checksums", "Skip CRC32 checks (faster, less safe)") { no_checksums = true }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(db_path, db_config(no_checksums))
       server = Server.new(db, host, port)
       server.run
       db.close
@@ -61,11 +63,13 @@ module Cinderstore
       db_path = "cinderstore-data"
       key = ""
       value = ""
+      no_checksums = false
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--key KEY", "Key to write") { |v| key = v }
       parser.on("--value VALUE", "Value to write") { |v| value = v }
+      parser.on("--no-checksums", "Skip CRC32 checks (faster, less safe)") { no_checksums = true }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
@@ -73,7 +77,7 @@ module Cinderstore
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(db_path, db_config(no_checksums))
       begin
         db.put(key, value)
         puts "ok"
@@ -114,10 +118,12 @@ module Cinderstore
     private def run_delete(rest : Array(String)) : Int32
       db_path = "cinderstore-data"
       key = ""
+      no_checksums = false
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--key KEY", "Key to delete") { |v| key = v }
+      parser.on("--no-checksums", "Skip CRC32 checks (faster, less safe)") { no_checksums = true }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
@@ -125,7 +131,7 @@ module Cinderstore
         return 0
       end
       raise Error.new("missing --key") if key.empty?
-      db = DB.new(db_path)
+      db = DB.new(db_path, db_config(no_checksums))
       begin
         db.delete(key)
         puts "ok"
@@ -166,16 +172,18 @@ module Cinderstore
 
     private def run_simple(action : String, rest : Array(String)) : Int32
       db_path = "cinderstore-data"
+      no_checksums = false
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
+      parser.on("--no-checksums", "Skip CRC32 checks (faster, less safe)") { no_checksums = true }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(db_path, db_config(no_checksums))
       begin
         case action
         when "stats"
@@ -196,17 +204,25 @@ module Cinderstore
     private def run_demo(rest : Array(String)) : Int32
       db_path = nil
       fixture = nil
+      no_checksums = false
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--fixture PATH", "CSV fixture file") { |v| fixture = v }
+      parser.on("--no-checksums", "Skip CRC32 checks (faster, less safe)") { no_checksums = true }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      Demo.run(db_path, fixture)
+      Demo.run(db_path, fixture, !no_checksums)
+    end
+
+    private def db_config(no_checksums : Bool) : DB::Config
+      config = DB::Config.new
+      config.checksums = false if no_checksums
+      config
     end
 
     private def print_help : Nil

@@ -28,6 +28,10 @@ module Cinderstore
       property cache_blocks : Int32 = 512
       # Fsync after every write when true.
       property sync_writes : Bool = true
+      # Write a CRC32 guard per record and per block when true.
+      # Set to false to skip checksum work at the cost of corruption
+      # detection.
+      property checksums : Bool = true
       # Number of level-0 tables that trigger compaction.
       property l0_compact_threshold : Int32 = 4
       # Start background compaction after a flush when true.
@@ -374,7 +378,7 @@ module Cinderstore
     private def create_active_wal : Nil
       id = @next_id
       @next_id += 1
-      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes)
+      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes, @config.checksums)
     end
 
     # ------------------------------------------------------------------
@@ -429,7 +433,7 @@ module Cinderstore
           @next_id += 1
           wal_id = @next_id
           @next_id += 1
-          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes)
+          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes, @config.checksums)
         end
       end
 
@@ -459,7 +463,7 @@ module Cinderstore
       final_path = table_path(table_id)
       meta = nil
       File.open(tmp_path, "w") do |io|
-        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp)
+        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         mem.each_entry do |entry|
           writer.add(entry.key, entry.value, entry.seq, entry.alive)
         end
@@ -557,7 +561,7 @@ module Cinderstore
             id
           end
           io = File.open(File.join(@path, "#{Util.file_stem(current_id)}#{TMP_SUFFIX}"), "w")
-          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp)
+          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         end
         writer.not_nil!.add(entry.key, entry.value, entry.seq, true)
         written += 1

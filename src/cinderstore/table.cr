@@ -32,17 +32,25 @@ module Cinderstore
   # A data block holds the block length, a batch of serialized entries,
   # and a CRC32. The block index maps the first key of each block to its
   # file offset and total length. The bloom filter lets a reader skip a
-  # table that cannot contain a key. The footer stores offsets and a CRC32
-  # over the entire footer.
+  # table that cannot contain a key. The footer stores offsets, a format
+  # version, and a CRC32 over the entire footer.
+  #
+  # Fast tables use version two and skip every CRC32. The footer keeps its
+  # fixed size, so the reader can find the version before it decides how
+  # to verify the rest of the file.
   class SstableWriter
-    MAGIC       = 0x43494E4445525F31_u64
-    VERSION     =                  1_u32
-    FOOTER_SIZE =                     48
+    MAGIC = 0x43494E4445525F31_u64
+    # Format version that writes a CRC32 per block and on the footer.
+    VERSION_CHECKSUMMED = 1_u32
+    # Format version that writes no CRC32 guards.
+    VERSION_FAST = 2_u32
+    FOOTER_SIZE  =    48
 
     @io : IO
     @id : Int64
     @block_size : Int32
     @fpp : Float64
+    @checksums : Bool
     @pending : IO::Memory
     @pending_keys : Array(String)
     @keys : Array(String)
@@ -51,7 +59,8 @@ module Cinderstore
     @first : String?
     @last : String?
 
-    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01)
+    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01,
+                   @checksums : Bool = true)
       @io = io
       @pending = IO::Memory.new
       @pending_keys = [] of String
@@ -100,10 +109,14 @@ module Cinderstore
       footer.write_bytes(index_length.to_u64, IO::ByteFormat::LittleEndian)
       footer.write_bytes(bloom_offset.to_u64, IO::ByteFormat::LittleEndian)
       footer.write_bytes(bloom_length.to_u64, IO::ByteFormat::LittleEndian)
-      footer.write_bytes(VERSION, IO::ByteFormat::LittleEndian)
+      footer.write_bytes(@checksums ? VERSION_CHECKSUMMED : VERSION_FAST, IO::ByteFormat::LittleEndian)
       footer_bytes = footer.to_slice
       @io.write(footer_bytes)
-      @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
+      if @checksums
+        @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
+      else
+        @io.write(Bytes.new(4, 0_u8))
+      end
       @io.flush
 
       TableMeta.new(@id, @first.not_nil!, @last.not_nil!, @count)
@@ -114,8 +127,11 @@ module Cinderstore
       offset = @io.pos
       Util.write_varint(@io, data.size.to_u64)
       @io.write(data)
-      @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
-      total = Util.varint_len(data.size.to_u64) + data.size + 4
+      total = Util.varint_len(data.size.to_u64) + data.size
+      if @checksums
+        @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
+        total += 4
+      end
       @index << BlockIndexEntry.new(@pending_keys.first, offset.to_u64, total.to_u64)
       @pending = IO::Memory.new
       @pending_keys = [] of String
@@ -136,6 +152,7 @@ module Cinderstore
     @index_length : UInt64
     @bloom_offset : UInt64
     @bloom_length : UInt64
+    @version : UInt32
 
     def initialize(@path : String, @file_id : Int64, @cache : BlockCache? = nil)
       @file = File.open(@path, "r")
@@ -147,6 +164,7 @@ module Cinderstore
       @index_length = 0_u64
       @bloom_offset = 0_u64
       @bloom_length = 0_u64
+      @version = 0_u32
       read_footer
       read_index
       read_bloom
@@ -215,14 +233,18 @@ module Cinderstore
     private def read_block_raw(entry : BlockIndexEntry) : Bytes
       @file.pos = entry.offset
       data_len = Util.read_varint(@file).to_i
-      if data_len.to_u64 + Util.varint_len(data_len.to_u64) + 4 != entry.length
+      expected = data_len.to_u64 + Util.varint_len(data_len.to_u64).to_u64
+      expected += 4_u64 if @version == SstableWriter::VERSION_CHECKSUMMED
+      if expected != entry.length
         raise CorruptDataError.new("block length mismatch in #{@path}")
       end
       data = Bytes.new(data_len)
       @file.read_fully(data)
-      stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(data)
-      raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      if @version == SstableWriter::VERSION_CHECKSUMMED
+        stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+        actual_crc = Util.crc32(data)
+        raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      end
       data
     end
 
@@ -232,11 +254,6 @@ module Cinderstore
       footer = Bytes.new(SstableWriter::FOOTER_SIZE)
       @file.read_fully(footer)
 
-      crc_bytes = footer[SstableWriter::FOOTER_SIZE - 4, 4]
-      stored_crc = IO::Memory.new(crc_bytes).read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(footer[0, SstableWriter::FOOTER_SIZE - 4])
-      raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
-
       io = IO::Memory.new(footer)
       magic = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       raise CorruptDataError.new("bad magic in #{@path}") unless magic == SstableWriter::MAGIC
@@ -244,8 +261,18 @@ module Cinderstore
       @index_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       @bloom_offset = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       @bloom_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
-      version = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      raise CorruptDataError.new("unsupported version #{version} in #{@path}") unless version == SstableWriter::VERSION
+      @version = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+      case @version
+      when SstableWriter::VERSION_CHECKSUMMED
+        crc_bytes = footer[SstableWriter::FOOTER_SIZE - 4, 4]
+        stored_crc = IO::Memory.new(crc_bytes).read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+        actual_crc = Util.crc32(footer[0, SstableWriter::FOOTER_SIZE - 4])
+        raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      when SstableWriter::VERSION_FAST
+        # No checksum to verify in the fast format.
+      else
+        raise CorruptDataError.new("unsupported version #{@version} in #{@path}")
+      end
     end
 
     private def read_index : Nil

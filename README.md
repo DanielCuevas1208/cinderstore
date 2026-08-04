@@ -13,12 +13,13 @@ restart. It serves `get`, `put`, and `delete` over a local socket.
 Snapshots give you a consistent view of the store at one instant. A snapshot
 never blocks new writes. Release it when you are done.
 
-This is release 0.3.0. It adds point-in-time snapshots and consistent reads.
+This is release 0.4.0. It adds an optional checksum-free fast mode.
 
 ## Features
 
 - Memory table with ordered writes
 - Durable write ahead log with CRC32 framing
+- Optional checksum-free fast mode
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Background flush and compaction
@@ -59,7 +60,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. The
 output is deterministic.
 
 ```text
-== Cinderstore 0.3.0 demo ==
+== Cinderstore 0.4.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -106,11 +107,23 @@ Database directory: ...\cinderstore-demo
 8. Reopen the database and verify recovery
    rows after restart: 21
 
+9. Fast mode skips checksums
+   checksummed disk bytes: 1649
+   fast disk bytes:        1645
+   fast mode saves 4 bytes on disk
+   fast mode scan count: 24
+   fast mode snapshot rows: 24
+   fast mode rows after restart: 24
+
 Demo complete.
 ```
 
 Step 7 shows the value of a snapshot. The live store drops SKU-0001 and adds
 two products. The snapshot still sees the state before those writes.
+
+Step 9 shows the fast mode. Both databases hold the same data. The fast
+table drops the CRC32 guards, so it is smaller. Reads, snapshots, and
+recovery work the same.
 
 ## Use the library
 
@@ -132,6 +145,20 @@ db.scan("a", "z").each do |key, value|
 end
 db.close
 ```
+
+### Use fast mode
+
+Set `checksums` to `false` to skip CRC32 checks.
+
+```crystal
+config = Cinderstore::DB::Config.new
+config.checksums = false
+db = Cinderstore::DB.new("data/my-store", config)
+```
+
+Fast mode writes smaller files and does less CPU work. It cannot detect torn
+or corrupt data. Use it when a little risk is acceptable. Keep the default
+when data integrity matters most.
 
 ### Read a snapshot
 
@@ -225,6 +252,15 @@ Start the local server.
 bin/cinderstore server --db data --port 7654
 ```
 
+Run the demo without checksums.
+
+```console
+bin/cinderstore demo --no-checksums
+```
+
+The `server`, `put`, `del`, `flush`, and `compact` commands also accept
+`--no-checksums`.
+
 Run `bin/cinderstore help` for the full list of commands.
 
 ## Wire protocol
@@ -275,6 +311,19 @@ A write goes to two places at once.
 The default mode fsyncs after every write. Set `sync_writes` to `false` for
 faster, less durable writes.
 
+Every file records its own format. The log keeps a header. The table keeps a
+version in the footer. The reader detects the format, so a database can mix
+modes.
+
+### Fast mode
+
+Checksums find corruption. Each log record and each table block carries a
+CRC32. The footer carries one too. Verifying them costs CPU time.
+
+Fast mode skips every CRC32. Files are smaller and reads do less work.
+Corruption may go unnoticed. A fast file and a checked file can live in one
+database. Toggle `checksums` at any time.
+
 ### Flush
 
 When the memory table grows past its limit, the database freezes it. A new
@@ -313,8 +362,9 @@ blocks so repeated reads avoid disk.
 ### Recovery
 
 On open, the database replays the write ahead log into the memory table.
-Recovery is idempotent. A torn tail is detected by its CRC32 and skipped.
-The manifest lists every table. Orphan files from a crash are removed.
+Recovery is idempotent. A torn tail is skipped. With checksums on, the CRC32
+catches a torn tail. Without them, a short record stops the replay. The
+manifest lists every table. Orphan files from a crash are removed.
 
 ## On-disk format
 
@@ -324,7 +374,8 @@ Tables use a compact binary format.
 - A block index maps the first key of each block to its offset.
 - A bloom filter covers every key in the table.
 - A footer stores offsets, a version, and a CRC32.
-- Each block and each log record carries a CRC32.
+- Each block and each log record carries a CRC32 in the default format.
+- The fast format writes no CRC32 guards.
 
 Sequence numbers make versions unique. They are per-write and never reused.
 
@@ -339,6 +390,7 @@ config.memtable_limit = 4_i64 * 1024 * 1024
 config.bloom_fpp = 0.01
 config.cache_blocks = 512
 config.sync_writes = true
+config.checksums = true
 config.l0_compact_threshold = 4
 config.compact_on_flush = true
 db = Cinderstore::DB.new("data", config)
@@ -359,14 +411,14 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 97 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 108 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction, durability, snapshots, and the
-server protocol.
+and the database. It covers compaction, durability, snapshots, the server
+protocol, and the fast mode.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
-formatting, runs the suite, runs the demo, and builds the binary.
+formatting, runs the suite, runs both demos, and builds the binary.
 
 ## Limitations
 
@@ -377,20 +429,22 @@ formatting, runs the suite, runs the demo, and builds the binary.
 - Compaction is a full merge. It is correct and simple, not incremental.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
+- Fast mode cannot detect corruption. It skips every CRC32 guard.
 
 ## Roadmap
 
 Planned:
 
-- Release 0.2: incremental compaction by level
-- Release 0.4: optional checksum-free fast mode
 - Release 0.5: batch writes and group commit
-- Release 0.6: secondary indexes
+- Release 0.6: incremental compaction by level
+- Release 0.7: secondary indexes
 
 Delivered:
 
 - Release 0.3: snapshot iterators and consistent reads. Snapshots give a
   stable view of the store. Compaction keeps referenced files alive.
+- Release 0.4: optional checksum-free fast mode. Every file records its
+  format. Readers detect it, so modes can mix.
 
 ## License
 
