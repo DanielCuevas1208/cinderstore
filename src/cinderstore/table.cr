@@ -30,19 +30,28 @@ module Cinderstore
   #   [footer]
   #
   # A data block holds the block length, a batch of serialized entries,
-  # and a CRC32. The block index maps the first key of each block to its
-  # file offset and total length. The bloom filter lets a reader skip a
-  # table that cannot contain a key. The footer stores offsets and a CRC32
-  # over the entire footer.
+  # and an optional CRC32. The block index maps the first key of each
+  # block to its file offset and total length. The bloom filter lets a
+  # reader skip a table that cannot contain a key.
+  #
+  # The version-2 footer stores offsets, a version, a flag byte, and a
+  # CRC32. The flag byte says whether the data blocks carry checksums.
+  # Version-1 footers have no flag byte. Their blocks always carry
+  # checksums. The reader reads the version and the flag from the file,
+  # so one process can open tables written in either mode.
   class SstableWriter
-    MAGIC       = 0x43494E4445525F31_u64
-    VERSION     =                  1_u32
-    FOOTER_SIZE =                     48
+    MAGIC              = 0x43494E4445525F31_u64
+    VERSION            =                  2_u32
+    LEGACY_VERSION     =                  1_u32
+    FOOTER_SIZE        =                     52
+    LEGACY_FOOTER_SIZE =                     48
+    FLAG_CHECKSUM      =                   1_u8
 
     @io : IO
     @id : Int64
     @block_size : Int32
     @fpp : Float64
+    @checksums : Bool
     @pending : IO::Memory
     @pending_keys : Array(String)
     @keys : Array(String)
@@ -51,7 +60,8 @@ module Cinderstore
     @first : String?
     @last : String?
 
-    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096, @fpp : Float64 = 0.01)
+    def initialize(io : IO, @id : Int64, @block_size : Int32 = 4096,
+                   @fpp : Float64 = 0.01, @checksums : Bool = true)
       @io = io
       @pending = IO::Memory.new
       @pending_keys = [] of String
@@ -101,6 +111,8 @@ module Cinderstore
       footer.write_bytes(bloom_offset.to_u64, IO::ByteFormat::LittleEndian)
       footer.write_bytes(bloom_length.to_u64, IO::ByteFormat::LittleEndian)
       footer.write_bytes(VERSION, IO::ByteFormat::LittleEndian)
+      footer.write_byte(@checksums ? FLAG_CHECKSUM : 0_u8)
+      3.times { footer.write_byte(0_u8) }
       footer_bytes = footer.to_slice
       @io.write(footer_bytes)
       @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
@@ -114,8 +126,10 @@ module Cinderstore
       offset = @io.pos
       Util.write_varint(@io, data.size.to_u64)
       @io.write(data)
-      @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
-      total = Util.varint_len(data.size.to_u64) + data.size + 4
+      if @checksums
+        @io.write_bytes(Util.crc32(data), IO::ByteFormat::LittleEndian)
+      end
+      total = Util.varint_len(data.size.to_u64) + data.size + (@checksums ? 4 : 0)
       @index << BlockIndexEntry.new(@pending_keys.first, offset.to_u64, total.to_u64)
       @pending = IO::Memory.new
       @pending_keys = [] of String
@@ -136,6 +150,7 @@ module Cinderstore
     @index_length : UInt64
     @bloom_offset : UInt64
     @bloom_length : UInt64
+    @checksums : Bool
 
     def initialize(@path : String, @file_id : Int64, @cache : BlockCache? = nil)
       @file = File.open(@path, "r")
@@ -147,6 +162,7 @@ module Cinderstore
       @index_length = 0_u64
       @bloom_offset = 0_u64
       @bloom_length = 0_u64
+      @checksums = true
       read_footer
       read_index
       read_bloom
@@ -215,27 +231,57 @@ module Cinderstore
     private def read_block_raw(entry : BlockIndexEntry) : Bytes
       @file.pos = entry.offset
       data_len = Util.read_varint(@file).to_i
-      if data_len.to_u64 + Util.varint_len(data_len.to_u64) + 4 != entry.length
+      crc_len = @checksums ? 4 : 0
+      if data_len.to_u64 + Util.varint_len(data_len.to_u64) + crc_len != entry.length
         raise CorruptDataError.new("block length mismatch in #{@path}")
       end
       data = Bytes.new(data_len)
       @file.read_fully(data)
-      stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(data)
-      raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      if @checksums
+        stored_crc = @file.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+        actual_crc = Util.crc32(data)
+        raise CorruptDataError.new("block checksum mismatch in #{@path}") unless stored_crc == actual_crc
+      end
       data
     end
 
     private def read_footer : Nil
-      raise CorruptDataError.new("file too small: #{@path}") if @size < SstableWriter::FOOTER_SIZE
-      @file.pos = @size - SstableWriter::FOOTER_SIZE
-      footer = Bytes.new(SstableWriter::FOOTER_SIZE)
+      raise CorruptDataError.new("file too small: #{@path}") if @size < SstableWriter::LEGACY_FOOTER_SIZE
+      if @size >= SstableWriter::FOOTER_SIZE
+        @file.pos = @size - SstableWriter::FOOTER_SIZE
+        footer = Bytes.new(SstableWriter::FOOTER_SIZE)
+        @file.read_fully(footer)
+        return if read_footer_v2(footer)
+      end
+      # The footer is version 1, so its layout is smaller.
+      @file.pos = @size - SstableWriter::LEGACY_FOOTER_SIZE
+      footer = Bytes.new(SstableWriter::LEGACY_FOOTER_SIZE)
       @file.read_fully(footer)
+      read_footer_v1(footer)
+    end
 
-      crc_bytes = footer[SstableWriter::FOOTER_SIZE - 4, 4]
-      stored_crc = IO::Memory.new(crc_bytes).read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      actual_crc = Util.crc32(footer[0, SstableWriter::FOOTER_SIZE - 4])
-      raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
+    # Reads a version-2 footer. Returns false when the magic does not match,
+    # which means the file predates the version-2 layout.
+    private def read_footer_v2(footer : Bytes) : Bool
+      io = IO::Memory.new(footer)
+      magic = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
+      return false unless magic == SstableWriter::MAGIC
+
+      verify_footer_crc(footer, SstableWriter::FOOTER_SIZE)
+
+      @index_offset = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
+      @index_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
+      @bloom_offset = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
+      @bloom_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
+      version = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+      raise CorruptDataError.new("unsupported version #{version} in #{@path}") unless version == SstableWriter::VERSION
+      flags = io.read_byte.not_nil!
+      @checksums = (flags & SstableWriter::FLAG_CHECKSUM) != 0
+      true
+    end
+
+    private def read_footer_v1(footer : Bytes) : Nil
+      verify_footer_crc(footer, SstableWriter::LEGACY_FOOTER_SIZE)
 
       io = IO::Memory.new(footer)
       magic = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
@@ -245,7 +291,16 @@ module Cinderstore
       @bloom_offset = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       @bloom_length = io.read_bytes(UInt64, IO::ByteFormat::LittleEndian)
       version = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-      raise CorruptDataError.new("unsupported version #{version} in #{@path}") unless version == SstableWriter::VERSION
+      raise CorruptDataError.new("unsupported version #{version} in #{@path}") unless version == SstableWriter::LEGACY_VERSION
+      @checksums = true
+    end
+
+    # Checks the CRC32 that guards the fixed part of a footer.
+    private def verify_footer_crc(footer : Bytes, size : Int32) : Nil
+      crc_bytes = footer[size - 4, 4]
+      stored_crc = IO::Memory.new(crc_bytes).read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+      actual_crc = Util.crc32(footer[0, size - 4])
+      raise CorruptDataError.new("footer checksum mismatch in #{@path}") unless stored_crc == actual_crc
     end
 
     private def read_index : Nil

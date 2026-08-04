@@ -6,11 +6,11 @@ module Cinderstore
   # The demo loads a small product catalog, writes it, scans a range,
   # flushes, compacts, and verifies recovery. Its output is deterministic.
   class Demo
-    def self.run(db_path : String? = nil, fixture : String? = nil) : Int32
-      new(db_path, fixture).run
+    def self.run(db_path : String? = nil, fixture : String? = nil, checksums : Bool = true) : Int32
+      new(db_path, fixture, checksums).run
     end
 
-    def initialize(@db_path : String? = nil, @fixture : String? = nil)
+    def initialize(@db_path : String? = nil, @fixture : String? = nil, @checksums : Bool = true)
     end
 
     def run : Int32
@@ -19,21 +19,22 @@ module Cinderstore
       fixture_path = resolve_fixture
       raise Error.new("fixture not found: #{fixture_path}") unless File.exists?(fixture_path)
 
-      rows = load_fixture(fixture_path)
-      raise Error.new("fixture is empty") if rows.empty?
+      catalog = load_fixture(fixture_path)
+      raise Error.new("fixture is empty") if catalog.empty?
 
       config = DB::Config.new
       config.sync_writes = false
       config.compact_on_flush = false
+      config.checksums = @checksums
       db = DB.new(path, config)
 
       puts "== Cinderstore #{VERSION} demo =="
       puts ""
-      puts "Loaded #{rows.size} products from #{fixture_path}"
+      puts "Loaded #{catalog.size} products from #{fixture_path}"
       puts "Database directory: #{path}"
       puts ""
 
-      rows.each do |sku, name, price, stock|
+      catalog.each do |sku, name, price, stock|
         db.put(sku, %({"name":"#{name}","price":#{price},"stock":#{stock}}))
       end
 
@@ -110,6 +111,7 @@ module Cinderstore
       levels_config = DB::Config.new
       levels_config.sync_writes = false
       levels_config.compact_on_flush = false
+      levels_config.checksums = @checksums
       levels_config.memtable_limit = 2_000
       levels_config.l0_compact_threshold = 2
       levels_config.level_ratio = 2.0
@@ -128,8 +130,47 @@ module Cinderstore
       level_db.close
       puts ""
 
+      puts "10. Fast mode skips checksums on new writes"
+      checked_path = File.join(Dir.tempdir, "cinderstore-checked-demo")
+      fast_path = File.join(Dir.tempdir, "cinderstore-fast-demo")
+      FileUtils.rm_rf(checked_path) if File.exists?(checked_path)
+      FileUtils.rm_rf(fast_path) if File.exists?(fast_path)
+      checked = write_mode_demo(checked_path, catalog, true)
+      fast = write_mode_demo(fast_path, catalog, false)
+      puts "   checksummed: wal #{checked[0]} bytes, disk #{checked[1]} bytes"
+      puts "   fast mode:   wal #{fast[0]} bytes, disk #{fast[1]} bytes"
+      reopened = DB.new(fast_path)
+      puts "   all #{reopened.scan.size} rows readable after a fast-mode restart"
+      reopened.close
+      puts ""
+
       puts "Demo complete."
       0
+    end
+
+    # Writes the catalog into a fresh database and reports the file sizes.
+    #
+    # The catalog is written three times so the checksums produce a clear
+    # byte difference. The return value is the WAL size before the flush
+    # and the table size after it.
+    private def write_mode_demo(db_path : String, rows : Array(Tuple(String, String, String, String)),
+                                checksums : Bool) : Tuple(Int64, Int64)
+      config = DB::Config.new
+      config.sync_writes = false
+      config.compact_on_flush = false
+      config.block_size = 128
+      config.checksums = checksums
+      db = DB.new(db_path, config)
+      3.times do |round|
+        rows.each do |sku, name, price, stock|
+          db.put("%d-%s" % {round, sku}, %({"name":"#{name}","price":#{price},"stock":#{stock}}))
+        end
+      end
+      wal_bytes = db.stats.wal_bytes
+      db.flush
+      disk_bytes = db.stats.disk_bytes
+      db.close
+      {wal_bytes, disk_bytes}
     end
 
     private def print_stats(db : DB) : Nil

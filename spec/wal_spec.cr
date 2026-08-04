@@ -52,14 +52,90 @@ describe Cinderstore::Wal do
     writer.append(Cinderstore::Entry.new("alpha", 1_i64, true, "1"))
     writer.close
 
-    # Flip a byte inside the record body.
+    # Flip a byte inside the record payload. The header is five bytes long,
+    # so the value byte of the first entry starts at offset 15.
     bytes = File.read(path).to_slice.dup
-    bytes[1] = (bytes[1] ^ 0xFF).to_u8
+    bytes[15] = (bytes[15] ^ 0xFF).to_u8
     File.open(path, "w") { |f| f.write(bytes) }
 
     mem = Cinderstore::MemTable.new
     Cinderstore::Wal.recover(path, mem, 0_i64)
     mem.empty?.should be_true
+  end
+
+  it "round trips without checksums in fast mode" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append(Cinderstore::Entry.new("a", 1_i64, true, "one"))
+    writer.append(Cinderstore::Entry.new("b", 2_i64, false, ""))
+    writer.close
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(2_i64)
+    mem.get("a").should eq("one")
+    mem.get("b").should be_nil
+    mem.get_entry("b").not_nil!.alive.should be_false
+  end
+
+  it "does not verify payloads in fast mode" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append(Cinderstore::Entry.new("alpha", 1_i64, true, "1"))
+    writer.close
+
+    # Flip the value byte. No checksum exists to catch the change.
+    bytes = File.read(path).to_slice.dup
+    bytes[15] = (bytes[15] ^ 0xFF).to_u8
+    File.open(path, "w") { |f| f.write(bytes) }
+
+    mem = Cinderstore::MemTable.new
+    Cinderstore::Wal.recover(path, mem, 0_i64)
+    mem.get("alpha").should_not eq("1")
+    mem.get_entry("alpha").not_nil!.seq.should eq(1_i64)
+  end
+
+  it "stops at a torn tail in fast mode" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append(Cinderstore::Entry.new("alpha", 1_i64, true, "1"))
+    writer.append(Cinderstore::Entry.new("beta", 2_i64, true, "2"))
+    writer.append(Cinderstore::Entry.new("gamma", 3_i64, true, "3"))
+    writer.close
+
+    # Cut the last record in half. This simulates a torn write.
+    Cinderstore::SpecHelpers.truncate(path, File.size(path) - 3)
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(2_i64)
+    mem.get("alpha").should eq("1")
+    mem.get("beta").should eq("2")
+    mem.get("gamma").should be_nil
+  end
+
+  it "replays a legacy version-1 log that has no header" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    # A version-1 log stores framed records back to back with no header.
+    # Each record carries a checksum.
+    File.open(path, "w") do |io|
+      io.write(Cinderstore::Wal.encode(Cinderstore::Entry.new("a", 1_i64, true, "one")))
+      io.write(Cinderstore::Wal.encode(Cinderstore::Entry.new("b", 2_i64, true, "two")))
+    end
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(2_i64)
+    mem.get("a").should eq("one")
+    mem.get("b").should eq("two")
   end
 
   it "survives a restart through the database" do

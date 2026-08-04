@@ -3,8 +3,8 @@
 [![CI](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielCuevas1208/cinderstore/actions/workflows/ci.yml)
 
 Cinderstore is an embeddable key and value store. It is built on a log
-structured merge tree (LSM tree). It is written in Crystal and uses only the
-Crystal standard library.
+structured merge tree. It is written in Crystal and uses only the Crystal
+standard library.
 
 The store keeps a write ahead log for durability. It flushes memory to sorted
 files. It merges those files during compaction. It recovers all data after a
@@ -13,13 +13,15 @@ restart. It serves `get`, `put`, and `delete` over a local socket.
 Snapshots give you a consistent view of the store at one instant. A snapshot
 never blocks new writes. Release it when you are done.
 
-This is release 0.4.0. It adds level-based compaction. Tables cascade from
-level 0 to deeper levels, and each level stays within its size target.
+This is release 0.5.0. It adds an optional checksum-free fast mode. New data
+can skip CRC32 checksums for higher throughput. The reader detects the mode
+from the file format, so one process opens both kinds of file.
 
 ## Features
 
 - Memory table with ordered writes
 - Durable write ahead log with CRC32 framing
+- Optional checksums for higher write throughput
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
 - Level-based compaction with size targets per level
@@ -54,6 +56,12 @@ Run the demo.
 bin/cinderstore demo
 ```
 
+Run the demo in fast mode.
+
+```console
+bin/cinderstore demo --no-checksums
+```
+
 ## Demo output
 
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
@@ -61,7 +69,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. The
 output is deterministic.
 
 ```text
-== Cinderstore 0.4.0 demo ==
+== Cinderstore 0.5.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -79,16 +87,16 @@ Database directory: ...\cinderstore-demo
 
 3. Flush memtable to a sorted table
    tables: 1 (l0: 1, l1: 0), entries: 24
-   disk bytes: 1649, memtable bytes: 0
+   disk bytes: 1653, memtable bytes: 0
 
 4. Delete 4 products, update 2 products, then flush again
    tables: 2 (l0: 2, l1: 0), entries: 30
-   disk bytes: 1902, memtable bytes: 0
+   disk bytes: 1910, memtable bytes: 0
    The deleted keys still occupy space in the level-0 tables.
 
 5. Compact merges the tables and drops the deleted keys
    tables: 1 (l0: 0, l1: 1), entries: 20
-   disk bytes: 1384, memtable bytes: 0
+   disk bytes: 1388, memtable bytes: 0
    The store keeps the newest value for each key.
 
 6. Verify deletes and updates after compaction
@@ -113,6 +121,11 @@ Database directory: ...\cinderstore-demo
    after compact_levels:          [0, 0, 1]
    all 100 rows still readable
 
+10. Fast mode skips checksums on new writes
+   checksummed: wal 5159 bytes, disk 5692 bytes
+   fast mode:   wal 4871 bytes, disk 5548 bytes
+   all 72 rows readable after a fast-mode restart
+
 Demo complete.
 ```
 
@@ -122,6 +135,11 @@ two products. The snapshot still sees the state before those writes.
 Step 9 shows the value of leveled compaction. Five flushes create five
 level-0 tables. `compact_levels` merges them into a fresh level-2 table, so
 the store stays tidy as it grows.
+
+Step 10 shows the value of fast mode. It writes the same 72 rows twice. Fast
+mode skips the CRC32 on every log record and every table block. Its log is
+288 bytes smaller, and its table is 144 bytes smaller. The data still round
+trips after a restart.
 
 ## Use the library
 
@@ -244,6 +262,12 @@ Start the local server.
 bin/cinderstore server --db data --port 7654
 ```
 
+Run the server in fast mode.
+
+```console
+bin/cinderstore server --db data --port 7654 --no-checksums
+```
+
 Run `bin/cinderstore help` for the full list of commands.
 
 ## Wire protocol
@@ -292,7 +316,8 @@ A write goes to two places at once.
 2. Insert the entry into the memory table.
 
 The default mode fsyncs after every write. Set `sync_writes` to `false` for
-faster, less durable writes.
+faster, less durable writes. Set `checksums` to `false` to skip the CRC32 on
+new data.
 
 ### Flush
 
@@ -356,8 +381,16 @@ Tables use a compact binary format.
 - Data blocks hold serialized entries.
 - A block index maps the first key of each block to its offset.
 - A bloom filter covers every key in the table.
-- A footer stores offsets, a version, and a CRC32.
-- Each block and each log record carries a CRC32.
+- A footer stores offsets, a version, a flag, and a CRC32.
+- Each block carries a CRC32 unless the flag turns it off.
+
+The write ahead log starts with a header. The header holds a magic value and
+a flag. The flag says whether the records carry checksums. The reader
+detects the mode from the file itself.
+
+Files from earlier releases have no header or flag. Their records and blocks
+always carry checksums. The reader handles both layouts, so an upgrade does
+not lose data.
 
 Sequence numbers make versions unique. They are per-write and never reused.
 
@@ -372,6 +405,7 @@ config.memtable_limit = 4_i64 * 1024 * 1024
 config.bloom_fpp = 0.01
 config.cache_blocks = 512
 config.sync_writes = true
+config.checksums = true
 config.l0_compact_threshold = 4
 config.compact_on_flush = true
 config.max_levels = 7
@@ -382,6 +416,11 @@ db = Cinderstore::DB.new("data", config)
 `max_levels` caps the number of levels. `level_ratio` sets how much data a
 deeper level may hold. A higher ratio compacts less often. Level L holds up
 to `memtable_limit * level_ratio ** L` bytes.
+
+`checksums` controls new writes. Set it to `false` to skip CRC32 checksums.
+This raises write throughput and shrinks each log record by four bytes. Each
+table block also saves four bytes. The reader still verifies files that
+carry checksums. Use fast mode for ephemeral data or data you can rebuild.
 
 ## Project layout
 
@@ -398,11 +437,12 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 108 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 118 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
 and the database. It covers compaction by level, durability, snapshots, and
-the server protocol.
+the server protocol. It covers both checksum modes and the legacy file
+layouts.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -413,6 +453,7 @@ formatting, runs the suite, runs both demos, and builds the binary.
 - Values are limited to 4 MB.
 - Keys are limited to 4 KB.
 - The server protocol is unencrypted. Use it on localhost only.
+- Fast mode cannot detect silent bit rot. It detects torn writes only.
 - `compact_levels` merges a whole level at once. A very large level makes a
   large merge. The level targets keep that merge rare.
 - No multi-threaded runtime is required. The server uses fibers.
@@ -422,12 +463,14 @@ formatting, runs the suite, runs both demos, and builds the binary.
 
 Planned:
 
-- Release 0.5: optional checksum-free fast mode
 - Release 0.6: batch writes and group commit
 - Release 0.7: secondary indexes
 
 Delivered:
 
+- Release 0.5: optional checksum-free fast mode. New data can skip CRC32
+  checksums. The on-disk format records the mode, so old and new files mix
+  safely.
 - Release 0.4: level-based compaction. Tables cascade from level 0 to deeper
   levels. Each level stays within its size target. Tombstones survive until
   the deepest level.

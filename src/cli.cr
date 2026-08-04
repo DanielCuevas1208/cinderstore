@@ -39,18 +39,20 @@ module Cinderstore
       db_path = "cinderstore-data"
       host = "127.0.0.1"
       port = 7654
+      config = DB::Config.new
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--host HOST", "Bind address") { |v| host = v }
       parser.on("--port PORT", "Listen on this port") { |v| port = v.to_i }
+      parser.on("--no-checksums", "Skip checksums on new writes") { config.checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      db = DB.new(db_path)
+      db = DB.new(db_path, config)
       server = Server.new(db, host, port)
       server.run
       db.close
@@ -196,17 +198,19 @@ module Cinderstore
     private def run_demo(rest : Array(String)) : Int32
       db_path = nil
       fixture = nil
+      checksums = true
       help = false
       parser = OptionParser.new
       parser.on("--db PATH", "Database directory") { |v| db_path = v }
       parser.on("--fixture PATH", "CSV fixture file") { |v| fixture = v }
+      parser.on("--no-checksums", "Skip checksums on new writes") { checksums = false }
       parser.on("-h", "--help", "Show this help") { help = true }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
-      Demo.run(db_path, fixture)
+      Demo.run(db_path, fixture, checksums)
     end
 
     private def print_help : Nil
