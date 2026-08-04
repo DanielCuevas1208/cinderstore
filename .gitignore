@@ -3,6 +3,7 @@
 /lib/
 /.shards/
 
+/.crystal/
 # Crystal
 *.dwarf
 *.dwarf.*

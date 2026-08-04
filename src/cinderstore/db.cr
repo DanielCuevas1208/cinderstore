@@ -471,6 +471,24 @@ module Cinderstore
       end
     end
 
+    # Returns a streaming iterator over live key/value pairs in key order.
+    #
+    # The iterator reads a snapshot taken at creation, so it stays
+    # consistent while the store keeps writing. The range is [start, finish).
+    # The iterator owns its snapshot. Call `close` when you are done.
+    #
+    def scan_iter(start_key : String = "", finish_key : String? = nil) : ScanIter
+      snap = snapshot
+      begin
+        iter = snap.scan_iter(start_key, finish_key)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
+      end
+    end
+
     # Flushes the active memtable to a new sorted table.
     def flush : Nil
       @flush_lock.synchronize do

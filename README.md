@@ -17,10 +17,13 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.8.0. It adds streaming iterators for secondary index
-queries. A query iterator reads a snapshot. It yields primary keys one at
-a time. You can stop early and close it. The server streams query results
-over the socket too.
+This is release 0.9.0. It adds streaming iterators for primary-key range
+scans. A scan iterator reads a snapshot. It yields live key/value pairs one
+at a time. You can stop early and close it.
+
+Release 0.8 added streaming iterators for secondary index queries. A query
+iterator yields primary keys one at a time. The server streams query results
+over the socket.
 
 Release 0.7 added secondary indexes. An index writes into a reserved part
 of the log structured merge tree. The write ahead log keeps the index
@@ -39,7 +42,7 @@ atomic with the data. Compaction drops stale index entries.
 - Background flush and compaction
 - Point-in-time snapshots with consistent reads
 - Snapshot iterators that stay valid during writes
-- Range scans with an iterator API
+- Streaming primary-key range scans
 - Secondary indexes with automatic maintenance
 - JSON field indexes with one API call
 - Exact and range queries over an index
@@ -84,7 +87,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates secondary indexes and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.8.0 demo ==
+== Cinderstore 0.9.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -168,6 +171,10 @@ Database directory: ...\cinderstore-demo
    live query after the delete          => (none)
    reopen and query by-stock "31"    => SKU-0010
 
+14. Streaming primary-key range scans
+   primary range SKU-0010 to SKU-0016 => SKU-0010, SKU-0013, SKU-0014, SKU-0015
+   snapshot still sees SKU-0010     => SKU-0010, SKU-0013, SKU-0014, SKU-0015
+
 Demo complete.
 ```
 
@@ -196,6 +203,10 @@ Step 13 shows the value of streaming iterators. An exact query streams its
 matches one at a time. A range query stops early after three rows. A
 snapshot stream still sees SKU-0012 after a delete removes it. The store
 recovers the index after a restart.
+
+Step 14 shows bounded primary-key streaming. The iterator returns live pairs
+in key order. The database iterator owns its snapshot until `close`.
+The snapshot iterator borrows its snapshot. A delete does not change its view.
 
 ## Use the library
 
@@ -284,6 +295,32 @@ Iterate a range with a block.
 ```crystal
 db.each("SKU-0100", "SKU-0200") do |key, value|
   process(key, value)
+end
+```
+
+### Stream a primary-key range
+
+Stream live pairs from a half-open primary-key range. The iterator yields one
+pair at a time.
+
+```crystal
+iter = db.scan_iter("SKU-0100", "SKU-0200")
+while pair = iter.next?
+  process(pair[0], pair[1])
+end
+iter.close
+```
+
+Close a database iterator when you finish. It owns the snapshot it reads.
+
+Snapshot iterators borrow the snapshot. Closing one does not release the
+snapshot.
+
+```crystal
+db.snapshot do |snap|
+  iter = snap.scan_iter("SKU-0100", "SKU-0200")
+  iter.each { |key, value| process(key, value) }
+  iter.close
 end
 ```
 
@@ -560,6 +597,12 @@ can replace those files without breaking the snapshot.
 Snapshots never block writes. Reads over a snapshot use the same merge path
 as normal reads. Release a snapshot when you are done with it.
 
+### Primary-key scans
+
+A primary-key scan uses this merge path. It yields live pairs in key order.
+A database-level scan owns its snapshot. A snapshot-level scan borrows its
+snapshot.
+
 ### Secondary indexes
 
 An index entry is an ordinary entry in a reserved key namespace. The entry
@@ -658,6 +701,7 @@ src/cinderstore/batch.cr Atomic batch writes
 src/cinderstore/commit_group.cr  Shared durability syncs
 src/cinderstore/index.cr Secondary index namespace
 src/cinderstore/index_query.cr  Streaming index query iterators
+src/cinderstore/scan_iter.cr    Streaming primary-key range iterators
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
@@ -668,17 +712,18 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 187 examples. All pass on Windows
-and Linux. It covers the skip list, the memory table, the write ahead log,
-the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers batch writes, group commit, compaction by level,
-durability, snapshots, and the server protocol. It covers both checksum
-modes and the legacy file layouts. It covers secondary index maintenance,
-queries, recovery, and snapshots. It covers streaming index query iterators
-on databases, snapshots, and the server.
+The suite runs with `crystal spec`. It contains 191 examples. It covers the
+storage layers, recovery, durability, snapshots, indexes, and server protocol.
+It covers streaming index queries and primary-key range scans.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
+
+Current verification:
+
+- Formatting: passed locally.
+- Specs: the restricted sandbox blocked Crystal's final linker step.
+- Latest recorded PR run: passed before this release slice.
 
 ## Limitations
 
@@ -698,15 +743,21 @@ formatting, runs the suite, runs both demos, and builds the binary.
   large merge. The level targets keep that merge rare.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
-- A database-level query iterator holds a snapshot until you close it.
+- `scan_iter` has no built-in limit. Stop reading when you reach your limit.
+- A database-level scan or query iterator holds a snapshot until you close it.
 
 ## Roadmap
 
-Planned:
+Complete:
 
-- Release 0.9: streaming iterators for primary key range scans
+- Release 0.9: streaming primary-key range iterators. A database-level iterator
+  owns a snapshot. A snapshot-level iterator borrows its snapshot.
 
-Delivered:
+Remaining:
+
+- No later release scope is selected.
+
+Earlier releases:
 
 - Release 0.8: streaming iterators for secondary index queries. A query
   iterator reads a snapshot and yields primary keys one at a time. The

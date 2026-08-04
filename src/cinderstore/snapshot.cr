@@ -61,6 +61,17 @@ module Cinderstore
       end
     end
 
+    # Returns a streaming iterator over live key/value pairs in key order.
+    #
+    # The iterator shares this snapshot and reads the range [start, finish).
+    # Closing it never releases the snapshot. Release the snapshot when done.
+    def scan_iter(start_key : String = "", finish_key : String? = nil) : ScanIter
+      @lock.synchronize do
+        check_released
+        ScanIter.new(self, SnapshotIter.new(self, LiveIter.new(make_merge_iter(start_key, false))), finish_key)
+      end
+    end
+
     # Yields live key/value pairs in key order. The range is [start, finish).
     def each(start_key : String = "", finish_key : String? = nil, &block : String, String ->) : Nil
       scan(start_key, finish_key).each { |key, value| yield key, value }

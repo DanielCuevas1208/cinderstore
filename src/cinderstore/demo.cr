@@ -246,6 +246,20 @@ module Cinderstore
       index_db.close
       reopened = DB.new(index_path)
       puts "   reopen and query by-stock \"31\"    => #{format_keys(reopened.query("by-stock", "31"))}"
+      puts "14. Streaming primary-key range scans"
+      range_keys = [] of String
+      range_iter = reopened.scan_iter("SKU-0010", "SKU-0016")
+      range_iter.each { |key, _value| range_keys << key }
+      range_iter.close
+      puts "   primary range SKU-0010 to SKU-0016 => #{format_keys(range_keys)}"
+      range_snapshot = reopened.snapshot
+      reopened.delete("SKU-0010")
+      snapshot_range_keys = [] of String
+      snapshot_range_iter = range_snapshot.scan_iter("SKU-0010", "SKU-0016")
+      snapshot_range_iter.each { |key, _value| snapshot_range_keys << key }
+      snapshot_range_iter.close
+      range_snapshot.release
+      puts "   snapshot still sees SKU-0010     => #{format_keys(snapshot_range_keys)}"
       reopened.close
       puts ""
 

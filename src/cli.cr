@@ -166,11 +166,16 @@ module Cinderstore
       end
       db = DB.new(db_path)
       begin
-        rows = db.scan(start_key, finish_key.empty? ? nil : finish_key, limit)
-        rows.each do |key, value|
-          puts "#{key}\t#{value}"
+        iter = db.scan_iter(start_key, finish_key.empty? ? nil : finish_key)
+
+        count = 0
+        while pair = iter.next?
+          puts "#{pair[0]}\t#{pair[1]}"
+          count += 1
+          break if limit >= 0 && count >= limit
         end
       ensure
+        iter.close
         db.close
       end
       0
