@@ -13,14 +13,17 @@ restart. It serves `get`, `put`, and `delete` over a local socket.
 Snapshots give you a consistent view of the store at one instant. A snapshot
 never blocks new writes. Release it when you are done.
 
-This is release 0.5.0. It adds an optional checksum-free fast mode. New data
-can skip CRC32 checksums for higher throughput. The reader detects the mode
-from the file format, so one process opens both kinds of file.
+This is release 0.6.0. It adds atomic batch writes. A batch becomes one
+write ahead log record, so a crash drops the whole batch or nothing. It also
+adds group commit. Concurrent writes share one durability sync, which cuts
+the number of fsync calls.
 
 ## Features
 
 - Memory table with ordered writes
 - Durable write ahead log with CRC32 framing
+- Atomic batch writes in one log record
+- Group commit that shares one fsync between writers
 - Optional checksums for higher write throughput
 - Sorted tables with a block index and a bloom filter
 - Block cache for fast repeated reads
@@ -35,7 +38,7 @@ from the file format, so one process opens both kinds of file.
 
 ## Quick start
 
-You need Crystal 1.10 or newer.
+You need Crystal 1.21 or newer.
 
 ```console
 crystal spec
@@ -69,7 +72,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. The
 output is deterministic.
 
 ```text
-== Cinderstore 0.5.0 demo ==
+== Cinderstore 0.6.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -122,9 +125,17 @@ Database directory: ...\cinderstore-demo
    all 100 rows still readable
 
 10. Fast mode skips checksums on new writes
-   checksummed: wal 5159 bytes, disk 5692 bytes
-   fast mode:   wal 4871 bytes, disk 5548 bytes
+   checksummed: wal 5231 bytes, disk 5692 bytes
+   fast mode:   wal 4943 bytes, disk 5548 bytes
    all 72 rows readable after a fast-mode restart
+
+11. Batch writes and group commit
+   one batch wrote 24 rows as 1 write operation
+   sequence after the batch: 24
+   all 24 rows recovered after a restart
+
+   concurrent writes: 200, durability commits: 25
+   all 200 rows recovered after a restart
 
 Demo complete.
 ```
@@ -140,6 +151,11 @@ Step 10 shows the value of fast mode. It writes the same 72 rows twice. Fast
 mode skips the CRC32 on every log record and every table block. Its log is
 288 bytes smaller, and its table is 144 bytes smaller. The data still round
 trips after a restart.
+
+Step 11 shows the value of batches and group commit. One batch writes 24 rows
+in a single log record. Eight writers share one durability sync per round.
+They write 200 rows with 25 syncs instead of 200. The store still recovers
+every row after a restart.
 
 ## Use the library
 
@@ -161,6 +177,31 @@ db.scan("a", "z").each do |key, value|
 end
 db.close
 ```
+
+### Write a batch
+
+A batch applies many changes at once. All changes succeed together, or none
+do. A batch is one write ahead log record. A crash cannot apply half of it.
+
+```crystal
+batch = Cinderstore::Batch.new
+batch.put("bellows-copper", "in stock")
+batch.put("chimney-brush", "sold out")
+batch.delete("ash-rake")
+db.write(batch)
+```
+
+Build a batch in a block.
+
+```crystal
+db.write do |b|
+  b.put("bellows-copper", "in stock")
+  b.delete("ash-rake")
+end
+```
+
+A later operation in the batch overrides an earlier one. The operations use
+consecutive sequence numbers in queue order.
 
 ### Read a snapshot
 
@@ -315,9 +356,13 @@ A write goes to two places at once.
 1. Append the entry to the write ahead log.
 2. Insert the entry into the memory table.
 
-The default mode fsyncs after every write. Set `sync_writes` to `false` for
-faster, less durable writes. Set `checksums` to `false` to skip the CRC32 on
-new data.
+The default mode syncs each commit group. Concurrent writers share one
+group, so one fsync makes several writes durable. Set `sync_writes` to
+`false` for faster, less durable writes. Set `checksums` to `false` to skip
+the CRC32 on new data.
+
+A batch follows the same path. Its entries become one log record. Group
+commit still applies, so a batch waits for the same shared fsync.
 
 ### Flush
 
@@ -385,11 +430,12 @@ Tables use a compact binary format.
 - Each block carries a CRC32 unless the flag turns it off.
 
 The write ahead log starts with a header. The header holds a magic value and
-a flag. The flag says whether the records carry checksums. The reader
-detects the mode from the file itself.
+a flag byte. The flag says whether records carry checksums and a kind byte.
+The kind byte marks a single entry or a batch. The reader detects both
+settings from the file itself.
 
-Files from earlier releases have no header or flag. Their records and blocks
-always carry checksums. The reader handles both layouts, so an upgrade does
+Files from earlier releases have no header, or no kind byte. Their records
+always carry checksums. The reader handles every layout, so an upgrade does
 not lose data.
 
 Sequence numbers make versions unique. They are per-write and never reused.
@@ -422,11 +468,17 @@ This raises write throughput and shrinks each log record by four bytes. Each
 table block also saves four bytes. The reader still verifies files that
 carry checksums. Use fast mode for ephemeral data or data you can rebuild.
 
+`sync_writes` controls durability. When it is `true`, writers share commit
+groups and wait for one shared fsync. A single sequential writer still syncs
+once per write. When it is `false`, writes never fsync and return at once.
+
 ## Project layout
 
 ```text
 src/cinderstore.cr       Library entry point
 src/cinderstore/         Core components
+src/cinderstore/batch.cr Atomic batch writes
+src/cinderstore/commit_group.cr  Shared durability syncs
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
@@ -437,12 +489,12 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 118 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 146 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
-and the database. It covers compaction by level, durability, snapshots, and
-the server protocol. It covers both checksum modes and the legacy file
-layouts.
+and the database. It covers batch writes, group commit, compaction by level,
+durability, snapshots, and the server protocol. It covers both checksum
+modes and the legacy file layouts.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -454,6 +506,8 @@ formatting, runs the suite, runs both demos, and builds the binary.
 - Keys are limited to 4 KB.
 - The server protocol is unencrypted. Use it on localhost only.
 - Fast mode cannot detect silent bit rot. It detects torn writes only.
+- Group commit needs concurrent writers to share a sync. A single writer
+  still syncs once per write.
 - `compact_levels` merges a whole level at once. A very large level makes a
   large merge. The level targets keep that merge rare.
 - No multi-threaded runtime is required. The server uses fibers.
@@ -463,11 +517,12 @@ formatting, runs the suite, runs both demos, and builds the binary.
 
 Planned:
 
-- Release 0.6: batch writes and group commit
 - Release 0.7: secondary indexes
 
 Delivered:
 
+- Release 0.6: batch writes and group commit. A batch is one atomic write
+  ahead log record. Concurrent writers share one durability sync per group.
 - Release 0.5: optional checksum-free fast mode. New data can skip CRC32
   checksums. The on-disk format records the mode, so old and new files mix
   safely.

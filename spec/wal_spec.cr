@@ -88,9 +88,11 @@ describe Cinderstore::Wal do
     writer.append(Cinderstore::Entry.new("alpha", 1_i64, true, "1"))
     writer.close
 
-    # Flip the value byte. No checksum exists to catch the change.
+    # Flip the value byte. No checksum exists to catch the change. The
+    # header is five bytes, then the record length and kind bytes, then the
+    # key length and key, so the value starts at offset 16.
     bytes = File.read(path).to_slice.dup
-    bytes[15] = (bytes[15] ^ 0xFF).to_u8
+    bytes[16] = (bytes[16] ^ 0xFF).to_u8
     File.open(path, "w") { |f| f.write(bytes) }
 
     mem = Cinderstore::MemTable.new
@@ -136,6 +138,131 @@ describe Cinderstore::Wal do
     seq.should eq(2_i64)
     mem.get("a").should eq("one")
     mem.get("b").should eq("two")
+  end
+
+  it "replays a version-2 log whose records have no kind byte" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    # A version-2 log from release 0.5 has a header but no kind byte.
+    # Its records are single entries with checksums.
+    File.open(path, "w") do |io|
+      Cinderstore::Wal.write_header(io, true, false)
+      io.write(Cinderstore::Wal.encode(Cinderstore::Entry.new("a", 1_i64, true, "one")))
+      io.write(Cinderstore::Wal.encode(Cinderstore::Entry.new("b", 2_i64, true, "two")))
+    end
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(2_i64)
+    mem.get("a").should eq("one")
+    mem.get("b").should eq("two")
+  end
+
+  it "replays a batch of entries as one record" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false)
+    writer.append_batch([
+      Cinderstore::Entry.new("a", 1_i64, true, "one"),
+      Cinderstore::Entry.new("b", 2_i64, false, ""),
+      Cinderstore::Entry.new("c", 3_i64, true, "three"),
+    ])
+    writer.close
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(3_i64)
+    mem.get("a").should eq("one")
+    mem.get("c").should eq("three")
+    mem.get("b").should be_nil
+    mem.get_entry("b").not_nil!.alive.should be_false
+  end
+
+  it "replays a batch followed by a single entry" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false)
+    writer.append_batch([
+      Cinderstore::Entry.new("a", 1_i64, true, "one"),
+      Cinderstore::Entry.new("b", 2_i64, true, "two"),
+    ])
+    writer.append(Cinderstore::Entry.new("c", 3_i64, true, "three"))
+    writer.close
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(3_i64)
+    mem.get("a").should eq("one")
+    mem.get("b").should eq("two")
+    mem.get("c").should eq("three")
+  end
+
+  it "drops a torn batch whole, without applying any of its entries" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false)
+    writer.append(Cinderstore::Entry.new("before", 1_i64, true, "ok"))
+    writer.append_batch([
+      Cinderstore::Entry.new("a", 2_i64, true, "one"),
+      Cinderstore::Entry.new("b", 3_i64, true, "two"),
+      Cinderstore::Entry.new("c", 4_i64, true, "three"),
+    ])
+    writer.close
+
+    # Cut the batch record short. This simulates a torn write.
+    Cinderstore::SpecHelpers.truncate(path, File.size(path) - 3)
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(1_i64)
+    mem.get("before").should eq("ok")
+    mem.get("a").should be_nil
+    mem.get("b").should be_nil
+    mem.get("c").should be_nil
+  end
+
+  it "drops a torn batch whole in fast mode" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append(Cinderstore::Entry.new("before", 1_i64, true, "ok"))
+    writer.append_batch([
+      Cinderstore::Entry.new("a", 2_i64, true, "one"),
+      Cinderstore::Entry.new("b", 3_i64, true, "two"),
+    ])
+    writer.close
+
+    Cinderstore::SpecHelpers.truncate(path, File.size(path) - 3)
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(1_i64)
+    mem.get("before").should eq("ok")
+    mem.get("a").should be_nil
+    mem.get("b").should be_nil
+  end
+
+  it "round trips a batch in fast mode" do
+    dir = Cinderstore::SpecHelpers.tmp_db_path("wal")
+    Dir.mkdir_p(dir)
+    path = File.join(dir, "000001.wal")
+    writer = Cinderstore::Wal::Writer.new(path, false, false)
+    writer.append_batch([
+      Cinderstore::Entry.new("a", 1_i64, true, "one"),
+      Cinderstore::Entry.new("b", 2_i64, false, ""),
+    ])
+    writer.close
+
+    mem = Cinderstore::MemTable.new
+    seq = Cinderstore::Wal.recover(path, mem, 0_i64)
+    seq.should eq(2_i64)
+    mem.get("a").should eq("one")
+    mem.get("b").should be_nil
   end
 
   it "survives a restart through the database" do

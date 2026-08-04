@@ -251,6 +251,21 @@ describe Cinderstore::DB do
     end
   end
 
+  it "reports the number of writes in stats" do
+    Cinderstore::SpecHelpers.with_db("db-writes") do |db, _path|
+      db.put("a", "1")
+      db.delete("a")
+      db.write do |b|
+        b.put("x", "1")
+        b.put("y", "2")
+      end
+      stats = db.stats
+      stats.writes.should eq(3)
+      stats.to_h.keys.should contain("writes")
+      stats.to_h.keys.should contain("commits")
+    end
+  end
+
   it "rejects empty keys" do
     Cinderstore::SpecHelpers.with_db("db-invalid") do |db, _path|
       expect_raises(Cinderstore::InvalidKeyError) { db.put("", "v") }

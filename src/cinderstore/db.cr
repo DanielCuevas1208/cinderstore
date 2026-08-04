@@ -55,10 +55,13 @@ module Cinderstore
       getter seq : Int64
       getter cache_hits : Int64
       getter cache_misses : Int64
+      getter writes : Int64
+      getter commits : Int64
 
       def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @level_counts : Array(Int32),
                      @entries : Int64, @disk_bytes : Int64, @memtable_bytes : Int64,
-                     @wal_bytes : Int64, @seq : Int64, @cache_hits : Int64, @cache_misses : Int64)
+                     @wal_bytes : Int64, @seq : Int64, @cache_hits : Int64, @cache_misses : Int64,
+                     @writes : Int64, @commits : Int64)
       end
 
       def to_h : Hash(String, Int32 | Int64 | Array(Int32))
@@ -74,6 +77,8 @@ module Cinderstore
           "seq"            => @seq,
           "cache_hits"     => @cache_hits,
           "cache_misses"   => @cache_misses,
+          "writes"         => @writes,
+          "commits"        => @commits,
         }
       end
 
@@ -89,7 +94,8 @@ module Cinderstore
         io << "memtable bytes: #{@memtable_bytes}\n"
         io << "wal bytes: #{@wal_bytes}\n"
         io << "sequence: #{@seq}\n"
-        io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}"
+        io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}\n"
+        io << "writes: #{@writes}, commits: #{@commits}"
       end
     end
 
@@ -171,6 +177,8 @@ module Cinderstore
     @compacting = false
     @pending_table_id : Int64 = 0_i64
     @manifest : Manifest? = nil
+    @writes : Int64 = 0_i64
+    @commit_group : CommitGroup? = nil
 
     def initialize(path : String, config : Config = Config.new)
       @path = path
@@ -179,6 +187,7 @@ module Cinderstore
       @levels = [[] of TableRef]
       @block_cache = BlockCache.new(config.cache_blocks)
       open
+      @commit_group = CommitGroup.new if config.sync_writes
     end
 
     def path : String
@@ -189,24 +198,76 @@ module Cinderstore
     def put(key : String, value : String) : Nil
       validate_key(key)
       raise InvalidValueError.new("value exceeds #{MAX_VALUE_BYTES} bytes") if value.bytesize > MAX_VALUE_BYTES
+      wal : Wal::Writer? = nil
       @lock.synchronize do
         check_open
         @seq += 1
-        @wal.not_nil!.append(Entry.new(key, @seq, true, value))
+        wal = @wal.not_nil!
+        wal.append(Entry.new(key, @seq, true, value))
         @mem.put(key, value, @seq)
+        @writes += 1
       end
+      commit_wal(wal.not_nil!)
       trigger_flush
     end
 
     # Writes a tombstone for `key`.
     def delete(key : String) : Nil
       validate_key(key)
+      wal : Wal::Writer? = nil
       @lock.synchronize do
         check_open
         @seq += 1
-        @wal.not_nil!.append(Entry.new(key, @seq, false, ""))
+        wal = @wal.not_nil!
+        wal.append(Entry.new(key, @seq, false, ""))
         @mem.delete(key, @seq)
+        @writes += 1
       end
+      commit_wal(wal.not_nil!)
+    end
+
+    # Applies `batch` atomically.
+    #
+    # Every queued operation becomes one record in the write ahead log. A
+    # crash before the record is durable drops the whole batch, so the
+    # store never applies part of it. The sequence numbers of a batch are
+    # consecutive and assigned in queue order.
+    def write(batch : Batch) : Nil
+      return if batch.empty?
+      wal : Wal::Writer? = nil
+      @lock.synchronize do
+        check_open
+        ops = [] of Tuple(String, String, Bool)
+        batch.each do |key, value, alive|
+          validate_key(key)
+          raise InvalidValueError.new("value exceeds #{MAX_VALUE_BYTES} bytes") if value.bytesize > MAX_VALUE_BYTES
+          ops << {key, value, alive}
+        end
+        return if ops.empty?
+        entries = ops.map do |key, value, alive|
+          @seq += 1
+          Entry.new(key, @seq, alive, value)
+        end
+        wal = @wal.not_nil!
+        wal.append_batch(entries)
+        entries.each do |entry|
+          if entry.alive
+            @mem.put(entry.key, entry.value, entry.seq)
+          else
+            @mem.delete(entry.key, entry.seq)
+          end
+        end
+        @writes += 1
+      end
+      commit_wal(wal.not_nil!)
+      trigger_flush
+    end
+
+    # Builds a batch in a block, then writes it atomically.
+    def write(&block : Batch ->) : Nil
+      batch = Batch.new
+      yield batch
+      write(batch)
     end
 
     # Returns the live value for `key`, or nil.
@@ -330,6 +391,8 @@ module Cinderstore
           seq: @seq,
           cache_hits: @block_cache.hits,
           cache_misses: @block_cache.misses,
+          writes: @writes,
+          commits: @commit_group.try(&.commits) || 0_i64,
         )
       end
     end
@@ -346,6 +409,7 @@ module Cinderstore
           @levels.flatten.each(&.close)
         end
       end
+      @commit_group.try(&.shutdown)
     end
 
     # ------------------------------------------------------------------
@@ -513,6 +577,17 @@ module Cinderstore
         ensure
           @flushing = false
         end
+      end
+    end
+
+    # Makes the appended record durable.
+    #
+    # With `sync_writes` enabled the commit group batches this call with
+    # concurrent writers, so one fsync covers many records. Without it, no
+    # fsync happens and the call returns immediately.
+    private def commit_wal(wal : Wal::Writer) : Nil
+      if group = @commit_group
+        group.commit(wal)
       end
     end
 

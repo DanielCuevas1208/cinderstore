@@ -144,6 +144,50 @@ module Cinderstore
       reopened.close
       puts ""
 
+      puts "11. Batch writes and group commit"
+      batch_path = File.join(Dir.tempdir, "cinderstore-batch-demo")
+      FileUtils.rm_rf(batch_path) if File.exists?(batch_path)
+      batch_config = DB::Config.new
+      batch_config.sync_writes = false
+      batch_config.compact_on_flush = false
+      batch_db = DB.new(batch_path, batch_config)
+      batch_db.write do |b|
+        catalog.each do |sku, name, price, stock|
+          b.put(sku, %({"name":"#{name}","price":#{price},"stock":#{stock}}))
+        end
+      end
+      puts "   one batch wrote #{batch_db.scan.size} rows as 1 write operation"
+      puts "   sequence after the batch: #{batch_db.stats.seq}"
+      batch_db.close
+      reopened = DB.new(batch_path)
+      puts "   all #{reopened.scan.size} rows recovered after a restart"
+      reopened.close
+      puts ""
+
+      group_path = File.join(Dir.tempdir, "cinderstore-group-demo")
+      FileUtils.rm_rf(group_path) if File.exists?(group_path)
+      group_config = DB::Config.new
+      group_config.sync_writes = true
+      group_config.compact_on_flush = false
+      group_config.memtable_limit = 1_i64 << 30
+      group_db = DB.new(group_path, group_config)
+      done = Channel(Nil).new
+      8.times do |i|
+        spawn do
+          25.times do |j|
+            group_db.put("grow-%d-%02d" % {i, j}, "value-%d" % j)
+          end
+          done.send(nil)
+        end
+      end
+      8.times { done.receive }
+      puts "   concurrent writes: #{group_db.stats.writes}, durability commits: #{group_db.stats.commits}"
+      group_db.close
+      reopened = DB.new(group_path)
+      puts "   all #{reopened.scan.size} rows recovered after a restart"
+      reopened.close
+      puts ""
+
       puts "Demo complete."
       0
     end
