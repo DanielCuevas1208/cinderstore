@@ -103,6 +103,31 @@ module Cinderstore
       puts "   rows after restart: #{count}"
       reopened.close
       puts ""
+
+      puts "9. Leveled compaction keeps each level within its target"
+      levels_path = File.join(Dir.tempdir, "cinderstore-levels-demo")
+      FileUtils.rm_rf(levels_path) if File.exists?(levels_path)
+      levels_config = DB::Config.new
+      levels_config.sync_writes = false
+      levels_config.compact_on_flush = false
+      levels_config.memtable_limit = 2_000
+      levels_config.l0_compact_threshold = 2
+      levels_config.level_ratio = 2.0
+      levels_config.max_levels = 5
+      level_db = DB.new(levels_path, levels_config)
+      5.times do |batch|
+        20.times do |i|
+          level_db.put("row-%d-%02d" % {batch, i}, "value-" + "x" * 40)
+        end
+        level_db.flush
+      end
+      puts "   after 5 flushes, level counts: #{level_db.stats.level_counts}"
+      level_db.compact_levels
+      puts "   after compact_levels:          #{level_db.stats.level_counts}"
+      puts "   all #{level_db.scan.size} rows still readable"
+      level_db.close
+      puts ""
+
       puts "Demo complete."
       0
     end

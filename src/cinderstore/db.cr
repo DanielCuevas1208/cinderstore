@@ -32,6 +32,11 @@ module Cinderstore
       property l0_compact_threshold : Int32 = 4
       # Start background compaction after a flush when true.
       property compact_on_flush : Bool = true
+      # Upper bound on the number of levels, including level 0.
+      property max_levels : Int32 = 7
+      # Size ratio between levels. Level L may hold up to `level_ratio`
+      # times the data of level L - 1. A higher ratio runs less often.
+      property level_ratio : Float64 = 10.0
     end
 
     # A snapshot of database counters for reporting.
@@ -39,6 +44,7 @@ module Cinderstore
       getter tables : Int32
       getter l0 : Int32
       getter l1 : Int32
+      getter level_counts : Array(Int32)
       getter entries : Int64
       getter disk_bytes : Int64
       getter memtable_bytes : Int64
@@ -47,16 +53,17 @@ module Cinderstore
       getter cache_hits : Int64
       getter cache_misses : Int64
 
-      def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @entries : Int64,
-                     @disk_bytes : Int64, @memtable_bytes : Int64, @wal_bytes : Int64,
-                     @seq : Int64, @cache_hits : Int64, @cache_misses : Int64)
+      def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @level_counts : Array(Int32),
+                     @entries : Int64, @disk_bytes : Int64, @memtable_bytes : Int64,
+                     @wal_bytes : Int64, @seq : Int64, @cache_hits : Int64, @cache_misses : Int64)
       end
 
-      def to_h : Hash(String, Int32 | Int64)
+      def to_h : Hash(String, Int32 | Int64 | Array(Int32))
         {
           "tables"         => @tables,
           "l0"             => @l0,
           "l1"             => @l1,
+          "levels"         => @level_counts,
           "entries"        => @entries,
           "disk_bytes"     => @disk_bytes,
           "memtable_bytes" => @memtable_bytes,
@@ -73,6 +80,7 @@ module Cinderstore
 
       def to_s(io : IO) : Nil
         io << "tables: #{@tables} (l0: #{@l0}, l1: #{@l1})\n"
+        io << "levels: #{@level_counts}\n"
         io << "entries: #{@entries}\n"
         io << "disk bytes: #{@disk_bytes}\n"
         io << "memtable bytes: #{@memtable_bytes}\n"
@@ -250,6 +258,27 @@ module Cinderstore
       end
     end
 
+    # Runs level-by-level compaction until every level is within its target.
+    #
+    # Level 0 merges into level 1 when it holds enough tables. Deeper levels
+    # merge into the level below when they exceed their size target. Returns
+    # true when any table moved. The automatic background task uses this.
+    def compact_levels : Bool
+      @flush_lock.synchronize do
+        moved = false
+        loop do
+          level = @lock.synchronize do
+            return false if @closed
+            level_needing_compaction
+          end
+          break unless level
+          moved = true
+          compact_level_into(level)
+        end
+        moved
+      end
+    end
+
     # Returns an immutable view of the store at this instant.
     #
     # A snapshot copies the active memory table and keeps the table files it
@@ -290,6 +319,7 @@ module Cinderstore
           tables: table_refs.size,
           l0: @levels[0].size,
           l1: @levels.size > 1 ? @levels[1].size : 0,
+          level_counts: @levels.map(&.size),
           entries: entries,
           disk_bytes: disk_bytes,
           memtable_bytes: @mem.approximate_bytes,
@@ -485,12 +515,13 @@ module Cinderstore
 
     private def trigger_compact : Nil
       return unless @config.compact_on_flush
-      return if @levels[0].size < @config.l0_compact_threshold
       return if @compacting
+      needs = @lock.synchronize { !level_needing_compaction.nil? }
+      return unless needs
       @compacting = true
       spawn do
         begin
-          compact
+          compact_levels
         ensure
           @compacting = false
         end
@@ -501,6 +532,7 @@ module Cinderstore
     # Compaction
     # ------------------------------------------------------------------
 
+    # Merges every table into a fresh, non-overlapping level-1 set.
     private def do_compact : Nil
       tables = nil
       @lock.synchronize do
@@ -509,7 +541,7 @@ module Cinderstore
         return if tables.size < 2
       end
 
-      outputs = merge_tables(tables.not_nil!)
+      outputs = merge_tables(tables.not_nil!, true)
 
       @lock.synchronize do
         @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }]
@@ -523,8 +555,68 @@ module Cinderstore
       end
     end
 
-    # Merges every table into fresh tables and drops tombstones.
-    private def merge_tables(tables : Array(TableRef)) : Array(TableMeta)
+    # Returns the lowest level that needs compaction, or nil.
+    #
+    # Level 0 compacts by table count. Deeper levels compact when they hold
+    # more bytes than their target. The deepest level never compacts.
+    private def level_needing_compaction : Int32?
+      return nil if @config.max_levels < 2
+      return 0 if @levels[0].size >= @config.l0_compact_threshold
+      max_source = Math.min(@levels.size, @config.max_levels - 1) - 1
+      return nil if max_source < 1
+      (1..max_source).each do |level|
+        next if @levels[level].empty?
+        return level if level_size(level) > level_target(level)
+      end
+      nil
+    end
+
+    # Merges one level into the level below it.
+    #
+    # The merged range keeps the newest entry per key. Tombstones are kept
+    # unless the target level is the deepest, because deeper tables may hold
+    # older copies that the tombstone must hide.
+    private def compact_level_into(level : Int32) : Nil
+      target = level + 1
+      @lock.synchronize do
+        return if @closed
+        while @levels.size <= target
+          @levels << [] of TableRef
+        end
+      end
+
+      source_tables = nil
+      overlap = nil
+      @lock.synchronize do
+        source = @levels[level]
+        return if source.empty?
+        source_tables = source.dup
+        first = source.map(&.first).min
+        last = source.map(&.last).max
+        # Tables in the target level that overlap the source range. The
+        # target level is non-overlapping, so these form one contiguous set.
+        overlap = @levels[target].select { |ref| ref.last >= first && ref.first <= last }
+      end
+
+      inputs = source_tables.not_nil! + overlap.not_nil!
+      outputs = merge_tables(inputs, no_data_below?(target))
+
+      @lock.synchronize do
+        return if @closed
+        kept = @levels[target].select { |ref| !overlap.not_nil!.includes?(ref) }
+        @levels[target] = (kept + outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }).sort_by!(&.first)
+        @levels[level] = [] of TableRef
+        inputs.each do |ref|
+          ref.orphan
+          ref.release
+        end
+        save_manifest
+      end
+    end
+
+    # Merges tables into fresh tables. Keeps the newest entry per key.
+    # Drops tombstones only when `drop_tombstones` is true.
+    private def merge_tables(tables : Array(TableRef), drop_tombstones : Bool) : Array(TableMeta)
       readers = @lock.synchronize { tables.map { |ref| ref.reader(@block_cache) } }
       sources = [] of Store::Iter
       readers.each { |reader| sources << TableIter.new(reader) }
@@ -549,7 +641,7 @@ module Cinderstore
       }
 
       while entry = iter.next?
-        next unless entry.alive
+        next if drop_tombstones && !entry.alive
         if writer.nil?
           current_id = @lock.synchronize do
             id = @next_id
@@ -559,12 +651,29 @@ module Cinderstore
           io = File.open(File.join(@path, "#{Util.file_stem(current_id)}#{TMP_SUFFIX}"), "w")
           writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp)
         end
-        writer.not_nil!.add(entry.key, entry.value, entry.seq, true)
+        writer.not_nil!.add(entry.key, entry.value, entry.seq, entry.alive)
         written += 1
         finish_output.call if written >= MAX_TABLE_ENTRIES
       end
       finish_output.call
       outputs
+    end
+
+    # Returns true when every level below `level` holds no tables.
+    private def no_data_below?(level : Int32) : Bool
+      ((level + 1)...@levels.size).all? { |l| @levels[l].empty? }
+    end
+
+    # Returns the total bytes held by one level.
+    private def level_size(level : Int32) : Int64
+      @levels[level].sum { |ref| file_size(ref.path) }
+    end
+
+    # Returns the size target for a level. Each level may hold up to
+    # `level_ratio` times the data of the level above it.
+    private def level_target(level : Int32) : Int64
+      scale = @config.level_ratio ** level
+      (@config.memtable_limit * scale).to_i64
     end
 
     # ------------------------------------------------------------------
