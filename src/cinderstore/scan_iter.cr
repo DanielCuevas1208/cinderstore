@@ -1,5 +1,5 @@
 module Cinderstore
-  # Streams live key/value pairs over a primary key range.
+  # Streams live key/value pairs over a primary key range or prefix.
   #
   # The iterator reads from a snapshot, so it stays consistent while the
   # database keeps writing. Each `next?` returns the next live pair in
@@ -12,14 +12,16 @@ module Cinderstore
     @own_snapshot : Bool
 
     def initialize(@snapshot : Snapshot, @inner : Store::Iter, @finish_key : String?,
-                   @own_snapshot : Bool = false)
+                   @prefix : String? = nil, @own_snapshot : Bool = false)
     end
 
     # Returns the next key/value pair, or nil at the end of the range.
     def next? : Tuple(String, String)?
       finish = @finish_key
+      prefix = @prefix
       while entry = @inner.next?
         break if finish && entry.key >= finish
+        next if prefix && !entry.key.starts_with?(prefix)
         return {entry.key, entry.value}
       end
       nil

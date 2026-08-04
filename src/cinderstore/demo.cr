@@ -260,6 +260,12 @@ module Cinderstore
       snapshot_range_iter.close
       range_snapshot.release
       puts "   snapshot still sees SKU-0010     => #{format_keys(snapshot_range_keys)}"
+      puts "15. Prefix scans group keys"
+      prefix_keys = [] of String
+      prefix_iter = reopened.scan_prefix_iter("SKU-001")
+      prefix_iter.each { |key, _value| prefix_keys << key }
+      prefix_iter.close
+      puts "   live prefix SKU-001 => #{format_keys(prefix_keys)}"
       reopened.close
       puts ""
 

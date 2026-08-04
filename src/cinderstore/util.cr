@@ -65,5 +65,21 @@ module Cinderstore
     def self.file_stem(id : Int64) : String
       id.to_s.rjust(6, '0')
     end
+
+    # Returns the smallest byte string greater than every string with
+    # `prefix` as its prefix. Returns nil when no such bound exists.
+    def self.prefix_end(prefix : String) : String?
+      bytes = prefix.to_slice
+      index = bytes.size - 1
+      while index >= 0 && bytes[index] == UInt8::MAX
+        index -= 1
+      end
+      return nil if index < 0
+
+      String.build(index + 1) do |io|
+        io.write(bytes[0, index])
+        io.write_byte((bytes[index].to_i + 1).to_u8)
+      end
+    end
   end
 end

@@ -462,12 +462,42 @@ module Cinderstore
       pairs.each { |key, value| yield key, value }
     end
 
+    # Returns live key/value pairs whose keys start with `prefix`.
+    # A negative limit means no limit.
+    def scan_prefix(prefix : String, limit : Int32 = -1) : Array(Tuple(String, String))
+      iter = scan_prefix_iter(prefix)
+      result = [] of Tuple(String, String)
+      begin
+        while pair = iter.next?
+          result << pair
+          break if limit >= 0 && result.size >= limit
+        end
+        result
+      ensure
+        iter.close
+      end
+    end
+
     # Returns live key/value pairs in key order. The range is [start, finish).
     # A negative limit means no limit.
     def scan(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : Array(Tuple(String, String))
       @lock.synchronize do
         check_open
         collect_range(start_key, finish_key, limit)
+      end
+    end
+
+    # Returns a streaming iterator over live pairs whose keys start with
+    # `prefix`. The iterator owns the snapshot it creates.
+    def scan_prefix_iter(prefix : String) : ScanIter
+      snap = snapshot
+      begin
+        iter = snap.scan_prefix_iter(prefix)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
       end
     end
 

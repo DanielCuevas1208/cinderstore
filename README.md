@@ -17,9 +17,16 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.9.0. It adds streaming iterators for primary-key range
-scans. A scan iterator reads a snapshot. It yields live key/value pairs one
-at a time. You can stop early and close it.
+This is release 0.10.0. It adds prefix scans. A prefix scan returns live
+key/value pairs whose keys start with the prefix bytes.
+
+Prefix scans return arrays or streaming iterators. They use the existing
+ordered merge path. Database iterators own snapshots. Snapshot iterators borrow
+snapshots.
+
+Release 0.9 added streaming iterators for primary-key range scans. A scan
+iterator reads a snapshot. It yields live key/value pairs one at a time.
+You can stop early and close it.
 
 Release 0.8 added streaming iterators for secondary index queries. A query
 iterator yields primary keys one at a time. The server streams query results
@@ -43,6 +50,7 @@ atomic with the data. Compaction drops stale index entries.
 - Point-in-time snapshots with consistent reads
 - Snapshot iterators that stay valid during writes
 - Streaming primary-key range scans
+- Streaming primary-key prefix scans
 - Secondary indexes with automatic maintenance
 - JSON field indexes with one API call
 - Exact and range queries over an index
@@ -87,7 +95,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates secondary indexes and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.9.0 demo ==
+== Cinderstore 0.10.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -175,6 +183,9 @@ Database directory: ...\cinderstore-demo
    primary range SKU-0010 to SKU-0016 => SKU-0010, SKU-0013, SKU-0014, SKU-0015
    snapshot still sees SKU-0010     => SKU-0010, SKU-0013, SKU-0014, SKU-0015
 
+15. Prefix scans group keys
+   live prefix SKU-001 => SKU-0013, SKU-0014, SKU-0015
+
 Demo complete.
 ```
 
@@ -207,6 +218,9 @@ recovers the index after a restart.
 Step 14 shows bounded primary-key streaming. The iterator returns live pairs
 in key order. The database iterator owns its snapshot until `close`.
 The snapshot iterator borrows its snapshot. A delete does not change its view.
+
+Step 15 shows prefix scans. The scan starts at the prefix and stops at its
+byte successor. The iterator filters the range when no successor exists.
 
 ## Use the library
 
@@ -323,6 +337,25 @@ db.snapshot do |snap|
   iter.close
 end
 ```
+
+### Scan a key prefix
+
+Read every live key that starts with a prefix.
+
+```crystal
+pairs = db.scan_prefix("SKU-001")
+pairs.each { |key, value| process(key, value) }
+```
+
+Stream a prefix when the result can grow.
+
+```crystal
+iter = db.scan_prefix_iter("SKU-001")
+iter.each { |key, value| process(key, value) }
+iter.close
+```
+
+An empty prefix reads every live key. A negative limit means no limit.
 
 ### Use a secondary index
 
@@ -450,6 +483,12 @@ Scan a range.
 
 ```console
 bin/cinderstore scan --start a --finish z --limit 100
+```
+
+Scan a key prefix.
+
+```console
+bin/cinderstore scan --prefix SKU-001 --limit 10
 ```
 
 Query a secondary index.
@@ -702,6 +741,7 @@ src/cinderstore/commit_group.cr  Shared durability syncs
 src/cinderstore/index.cr Secondary index namespace
 src/cinderstore/index_query.cr  Streaming index query iterators
 src/cinderstore/scan_iter.cr    Streaming primary-key range iterators
+src/cinderstore/util.cr    Prefix range upper bounds
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
@@ -712,9 +752,9 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 191 examples. It covers the
+The suite runs with `crystal spec`. It contains 194 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
-It covers streaming index queries and primary-key range scans.
+It covers streaming index queries, range scans, and prefix scans.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -722,8 +762,10 @@ formatting, runs the suite, runs both demos, and builds the binary.
 Current verification:
 
 - Formatting: passed locally.
-- Specs: the restricted sandbox blocked Crystal's final linker step.
-- Latest recorded PR run: passed before this release slice.
+- Library and CLI type check: passed locally with `--no-codegen`.
+- Full specs and binary link: blocked locally by the restricted MSVC linker.
+- Earlier PR run: failed only at the binary build because `src/cli.cr` closed
+  a nullable scan iterator.
 
 ## Limitations
 
@@ -744,12 +786,14 @@ Current verification:
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
 - `scan_iter` has no built-in limit. Stop reading when you reach your limit.
-- A database-level scan or query iterator holds a snapshot until you close it.
+- A database-level scan, prefix, or query iterator holds a snapshot until you close it.
 
 ## Roadmap
 
 Complete:
 
+- Release 0.10: primary-key prefix scans. Materialized scans and streaming
+  iterators use one ordered merge path. Snapshot iterators borrow snapshots.
 - Release 0.9: streaming primary-key range iterators. A database-level iterator
   owns a snapshot. A snapshot-level iterator borrows its snapshot.
 

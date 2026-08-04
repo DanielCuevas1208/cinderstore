@@ -151,6 +151,7 @@ module Cinderstore
       db_path = "cinderstore-data"
       start_key = ""
       finish_key = ""
+      prefix : String? = nil
       limit = -1
       help = false
       parser = OptionParser.new
@@ -159,23 +160,33 @@ module Cinderstore
       parser.on("--finish KEY", "Last key (exclusive)") { |v| finish_key = v }
       parser.on("--limit N", "Maximum rows") { |v| limit = v.to_i }
       parser.on("-h", "--help", "Show this help") { help = true }
+      parser.on("--prefix PREFIX", "Keys that start with prefix") { |v| prefix = v }
       parser.parse(rest)
       if help
         puts parser
         return 0
       end
+      if prefix && (!start_key.empty? || !finish_key.empty?)
+        raise Error.new("--prefix cannot be combined with --start or --finish")
+      end
       db = DB.new(db_path)
+      iter : ScanIter? = nil
       begin
-        iter = db.scan_iter(start_key, finish_key.empty? ? nil : finish_key)
+        iter = if prefix
+                 db.scan_prefix_iter(prefix.not_nil!)
+               else
+                 db.scan_iter(start_key, finish_key.empty? ? nil : finish_key)
+               end
+        stream = iter.not_nil!
 
         count = 0
-        while pair = iter.next?
+        while pair = stream.next?
           puts "#{pair[0]}\t#{pair[1]}"
           count += 1
           break if limit >= 0 && count >= limit
         end
       ensure
-        iter.close
+        iter.try { |value| value.close }
         db.close
       end
       0

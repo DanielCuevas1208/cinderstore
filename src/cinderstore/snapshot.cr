@@ -43,6 +43,22 @@ module Cinderstore
       end
     end
 
+    # Returns live key/value pairs whose keys start with `prefix`.
+    # A negative limit means no limit.
+    def scan_prefix(prefix : String, limit : Int32 = -1) : Array(Tuple(String, String))
+      iter = scan_prefix_iter(prefix)
+      result = [] of Tuple(String, String)
+      begin
+        while pair = iter.next?
+          result << pair
+          break if limit >= 0 && result.size >= limit
+        end
+        result
+      ensure
+        iter.close
+      end
+    end
+
     # Returns live key/value pairs in key order. The range is [start, finish).
     # A negative limit means no limit.
     def scan(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : Array(Tuple(String, String))
@@ -58,6 +74,17 @@ module Cinderstore
           break if limit >= 0 && result.size >= limit
         end
         result
+      end
+    end
+
+    # Returns a streaming iterator over live pairs whose keys start with
+    # `prefix`. The iterator borrows this snapshot.
+    def scan_prefix_iter(prefix : String) : ScanIter
+      @lock.synchronize do
+        check_released
+        finish = Util.prefix_end(prefix)
+        inner = SnapshotIter.new(self, LiveIter.new(make_merge_iter(prefix, false)))
+        ScanIter.new(self, inner, finish, prefix)
       end
     end
 
