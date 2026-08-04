@@ -43,6 +43,22 @@ module Cinderstore
       end
     end
 
+    # Returns live key/value pairs whose keys start with `prefix`.
+    # A negative limit means no limit.
+    def scan_prefix(prefix : String, limit : Int32 = -1) : Array(Tuple(String, String))
+      iter = scan_prefix_iter(prefix)
+      result = [] of Tuple(String, String)
+      begin
+        while pair = iter.next?
+          result << pair
+          break if limit >= 0 && result.size >= limit
+        end
+        result
+      ensure
+        iter.close
+      end
+    end
+
     # Returns live key/value pairs in key order. The range is [start, finish).
     # A negative limit means no limit.
     def scan(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : Array(Tuple(String, String))
@@ -61,9 +77,79 @@ module Cinderstore
       end
     end
 
+    # Returns a streaming iterator over live pairs whose keys start with
+    # `prefix`. The iterator borrows this snapshot.
+    def scan_prefix_iter(prefix : String) : ScanIter
+      @lock.synchronize do
+        check_released
+        finish = Util.prefix_end(prefix)
+        inner = SnapshotIter.new(self, LiveIter.new(make_merge_iter(prefix, false)))
+        ScanIter.new(self, inner, finish, prefix)
+      end
+    end
+
+    # Returns a streaming iterator over live key/value pairs in key order.
+    #
+    # The iterator shares this snapshot and reads the range [start, finish).
+    # Closing it never releases the snapshot. Release the snapshot when done.
+    def scan_iter(start_key : String = "", finish_key : String? = nil) : ScanIter
+      @lock.synchronize do
+        check_released
+        ScanIter.new(self, SnapshotIter.new(self, LiveIter.new(make_merge_iter(start_key, false))), finish_key)
+      end
+    end
+
     # Yields live key/value pairs in key order. The range is [start, finish).
     def each(start_key : String = "", finish_key : String? = nil, &block : String, String ->) : Nil
       scan(start_key, finish_key).each { |key, value| yield key, value }
+    end
+
+    # Returns the primary keys whose value maps to `index_key` in `index`.
+    #
+    # The result reflects the state the snapshot holds. A negative `limit`
+    # means no limit. The keys come back in primary key order.
+    def query(index : String, index_key : String, limit : Int32 = -1) : Array(String)
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.exact_prefix(index, index_key)
+        keys = [] of String
+        iter = make_merge_iter(prefix, false)
+        while entry = iter.next?
+          break unless entry.key.starts_with?(prefix)
+          if entry.alive
+            keys << Index.primary_key_of(entry.key)
+            break if limit >= 0 && keys.size >= limit
+          end
+        end
+        keys
+      end
+    end
+
+    # Returns the primary keys whose index key lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. A negative `limit` means no limit.
+    def query_range(index : String, start_key : String = "", finish_key : String? = nil,
+                    limit : Int32 = -1) : Array(String)
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.name_prefix(index)
+        start = "#{prefix}#{start_key}#{Index::SEP}"
+        keys = [] of String
+        iter = make_merge_iter(start, false)
+        while entry = iter.next?
+          break unless entry.key.starts_with?(prefix)
+          index_key = Index.index_key_of(entry.key)
+          break if finish_key && index_key >= finish_key
+          if entry.alive
+            keys << Index.primary_key_of(entry.key)
+            break if limit >= 0 && keys.size >= limit
+          end
+        end
+        keys
+      end
     end
 
     # Returns a live iterator over the snapshot, starting at `start_key`.
@@ -74,6 +160,40 @@ module Cinderstore
       @lock.synchronize do
         check_released
         SnapshotIter.new(self, LiveIter.new(make_merge_iter(start_key, false)))
+      end
+    end
+
+    # Returns a streaming iterator over the primary keys that map to
+    # `index_key` in `index`.
+    #
+    # The result reflects the state the snapshot holds. The iterator shares
+    # the snapshot, so it stays consistent while the database keeps writing.
+    # Keys come back in primary key order. Close the iterator before you
+    # release the snapshot. Closing the iterator never releases the snapshot.
+    def query_iter(index : String, index_key : String) : IndexIter
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.exact_prefix(index, index_key)
+        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(prefix, false)), prefix, nil)
+      end
+    end
+
+    # Returns a streaming iterator over the primary keys whose index key
+    # lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. The iterator shares the snapshot,
+    # so it stays consistent while the database keeps writing. Close the
+    # iterator before you release the snapshot. Closing the iterator never
+    # releases the snapshot.
+    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil) : IndexIter
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.name_prefix(index)
+        start = "#{prefix}#{start_key}#{Index::SEP}"
+        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(start, false)), prefix, finish_key)
       end
     end
 
@@ -137,6 +257,12 @@ module Cinderstore
     private def validate_key(key : String) : Nil
       raise InvalidKeyError.new("key must not be empty") if key.empty?
       raise InvalidKeyError.new("key exceeds #{DB::MAX_KEY_BYTES} bytes") if key.bytesize > DB::MAX_KEY_BYTES
+      raise InvalidKeyError.new("key starts with the reserved index prefix") if Index.internal_key?(key)
+    end
+
+    private def validate_index_name(name : String) : Nil
+      raise InvalidIndexError.new("index name must not be empty") if name.empty?
+      raise InvalidIndexError.new("index name contains a NUL byte") if name.includes?(Index::SEP)
     end
 
     private def check_released : Nil

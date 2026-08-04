@@ -1,7 +1,7 @@
 name: cinderstore
-version: 0.4.0
+version: 0.10.0
 description: An embeddable key/value store built on a log structured merge tree.
-crystal: ">= 1.10.0"
+crystal: ">= 1.21.0"
 license: Apache-2.0
 authors:
   - Cinderstore Contributors
