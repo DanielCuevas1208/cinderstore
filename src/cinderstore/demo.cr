@@ -188,8 +188,49 @@ module Cinderstore
       reopened.close
       puts ""
 
+      puts "12. Secondary indexes track derived views"
+      index_path = File.join(Dir.tempdir, "cinderstore-index-demo")
+      FileUtils.rm_rf(index_path) if File.exists?(index_path)
+      index_config = DB::Config.new
+      index_config.sync_writes = false
+      index_config.compact_on_flush = false
+      index_db = DB.new(index_path, index_config)
+      index_db.create_json_index("by-name", "name")
+      index_db.create_json_index("by-price", "price")
+      index_db.create_json_index("by-stock", "stock")
+      catalog.each do |sku, name, price, stock|
+        index_db.put(sku, %({"name":"#{name}","price":#{price},"stock":#{stock}}))
+      end
+      index_db.flush
+      puts "   created indexes on name, price, and stock"
+      puts "   query by-name \"Ash Rake Forged\"  => #{format_keys(index_db.query("by-name", "Ash Rake Forged"))}"
+      puts "   query by-price \"14.0\"            => #{format_keys(index_db.query("by-price", "14.0"))}"
+      puts "   query by-stock \"31\"              => #{format_keys(index_db.query("by-stock", "31"))}"
+      puts "   stock range 20 to 30               => #{format_keys(index_db.query_range("by-stock", "20", "30"))}"
+      index_db.put("SKU-0010", %({"name":"Ash Rake Forged","price":15.50,"stock":31}))
+      index_db.flush
+      index_db.compact
+      puts "   update SKU-0010 price to 15.50, then flush and compact"
+      puts "   query by-price \"14.0\"            => #{format_keys(index_db.query("by-price", "14.0"))}"
+      puts "   query by-price \"15.5\"            => #{format_keys(index_db.query("by-price", "15.5"))}"
+      index_db.delete("SKU-0011")
+      index_db.flush
+      index_db.compact
+      puts "   delete SKU-0011, then flush and compact"
+      puts "   query by-name \"Coal Shovel Small\" => #{format_keys(index_db.query("by-name", "Coal Shovel Small"))}"
+      index_db.close
+      reopened = DB.new(index_path)
+      puts "   reopen and query by-stock \"31\"    => #{format_keys(reopened.query("by-stock", "31"))}"
+      reopened.close
+      puts ""
+
       puts "Demo complete."
       0
+    end
+
+    # Formats a query result for the demo output.
+    private def format_keys(keys : Array(String)) : String
+      keys.empty? ? "(none)" : keys.join(", ")
     end
 
     # Writes the catalog into a fresh database and reports the file sizes.

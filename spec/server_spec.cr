@@ -65,6 +65,25 @@ describe Cinderstore::Server do
     end
   end
 
+  it "serves queries over a secondary index" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("server-query", config) do |db, _path|
+      db.create_json_index("by-price", "price")
+      with_server(db) do |server|
+        sock = TCPSocket.new("127.0.0.1", server.port)
+        send_command(sock, "PUT a {\"price\":10}").should eq("OK")
+        sock << "QUERY by-price 10\n"
+        sock.flush
+        rows = [] of String
+        while (line = sock.gets) && line != "END"
+          rows << line
+        end
+        rows.should eq(["ROW a"])
+        sock.close
+      end
+    end
+  end
+
   it "reports protocol errors" do
     config = Cinderstore::SpecHelpers.fast_config
     Cinderstore::SpecHelpers.with_db("server-errors", config) do |db, _path|

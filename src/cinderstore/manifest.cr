@@ -14,11 +14,13 @@ module Cinderstore
       property first : String = ""
       property last : String = ""
       property count : Int64 = 0_i64
+      property index_count : Int64 = 0_i64
 
       def initialize
       end
 
-      def initialize(@id : Int64, @first : String, @last : String, @count : Int64)
+      def initialize(@id : Int64, @first : String, @last : String, @count : Int64,
+                     @index_count : Int64 = 0_i64)
       end
     end
 

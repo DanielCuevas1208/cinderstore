@@ -66,6 +66,54 @@ module Cinderstore
       scan(start_key, finish_key).each { |key, value| yield key, value }
     end
 
+    # Returns the primary keys whose value maps to `index_key` in `index`.
+    #
+    # The result reflects the state the snapshot holds. A negative `limit`
+    # means no limit. The keys come back in primary key order.
+    def query(index : String, index_key : String, limit : Int32 = -1) : Array(String)
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.exact_prefix(index, index_key)
+        keys = [] of String
+        iter = make_merge_iter(prefix, false)
+        while entry = iter.next?
+          break unless entry.key.starts_with?(prefix)
+          if entry.alive
+            keys << Index.primary_key_of(entry.key)
+            break if limit >= 0 && keys.size >= limit
+          end
+        end
+        keys
+      end
+    end
+
+    # Returns the primary keys whose index key lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. A negative `limit` means no limit.
+    def query_range(index : String, start_key : String = "", finish_key : String? = nil,
+                    limit : Int32 = -1) : Array(String)
+      validate_index_name(index)
+      @lock.synchronize do
+        check_released
+        prefix = Index.name_prefix(index)
+        start = "#{prefix}#{start_key}#{Index::SEP}"
+        keys = [] of String
+        iter = make_merge_iter(start, false)
+        while entry = iter.next?
+          break unless entry.key.starts_with?(prefix)
+          index_key = Index.index_key_of(entry.key)
+          break if finish_key && index_key >= finish_key
+          if entry.alive
+            keys << Index.primary_key_of(entry.key)
+            break if limit >= 0 && keys.size >= limit
+          end
+        end
+        keys
+      end
+    end
+
     # Returns a live iterator over the snapshot, starting at `start_key`.
     #
     # The iterator stays consistent while the database keeps writing. Close
@@ -137,6 +185,12 @@ module Cinderstore
     private def validate_key(key : String) : Nil
       raise InvalidKeyError.new("key must not be empty") if key.empty?
       raise InvalidKeyError.new("key exceeds #{DB::MAX_KEY_BYTES} bytes") if key.bytesize > DB::MAX_KEY_BYTES
+      raise InvalidKeyError.new("key starts with the reserved index prefix") if Index.internal_key?(key)
+    end
+
+    private def validate_index_name(name : String) : Nil
+      raise InvalidIndexError.new("index name must not be empty") if name.empty?
+      raise InvalidIndexError.new("index name contains a NUL byte") if name.includes?(Index::SEP)
     end
 
     private def check_released : Nil

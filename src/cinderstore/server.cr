@@ -93,6 +93,14 @@ module Cinderstore
         finish = tokens[2]?
         limit = tokens[3]?.try(&.to_i?) || -1
         Command.new(op, "", nil, start, finish, limit)
+      when "QUERY"
+        raise ProtocolError.new("missing index") if parts.size < 2
+        raise ProtocolError.new("missing index key") if parts.size < 3
+        Command.new(op, parts[1], parts[2], "", nil, -1)
+      when "QUERYRANGE"
+        tokens = line.split(" ")
+        raise ProtocolError.new("missing index") if tokens.size < 2
+        Command.new(op, tokens[1], nil, tokens[2]? || "", tokens[3]?, -1)
       when "STATS", "PING", "FLUSH", "COMPACT", "SHUTDOWN"
         Command.new(op, "", nil, "", nil, -1)
       else
@@ -126,6 +134,12 @@ module Cinderstore
             s << "END"
           end
         end
+      when "QUERY"
+        rows = @db.query(command.key, command.value.not_nil!)
+        format_index_rows(rows)
+      when "QUERYRANGE"
+        rows = @db.query_range(command.key, command.start, command.finish)
+        format_index_rows(rows)
       when "STATS"
         "STATS #{@db.stats.to_json}"
       when "PING"
@@ -141,6 +155,20 @@ module Cinderstore
         "BYE"
       else
         raise ProtocolError.new("unknown command")
+      end
+    end
+
+    # Formats a query result as one ROW line per primary key, then END.
+    private def format_index_rows(rows : Array(String)) : String
+      if rows.empty?
+        "END"
+      else
+        String.build do |s|
+          rows.each do |key|
+            s << "ROW #{key}\n"
+          end
+          s << "END"
+        end
       end
     end
   end

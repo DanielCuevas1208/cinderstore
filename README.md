@@ -8,15 +8,18 @@ standard library.
 
 The store keeps a write ahead log for durability. It flushes memory to sorted
 files. It merges those files during compaction. It recovers all data after a
-restart. It serves `get`, `put`, and `delete` over a local socket.
+restart. It serves `get`, `put`, `delete`, and `query` over a local socket.
 
 Snapshots give you a consistent view of the store at one instant. A snapshot
 never blocks new writes. Release it when you are done.
 
-This is release 0.6.0. It adds atomic batch writes. A batch becomes one
-write ahead log record, so a crash drops the whole batch or nothing. It also
-adds group commit. Concurrent writes share one durability sync, which cuts
-the number of fsync calls.
+Secondary indexes map derived keys to primary keys. The store keeps each
+index in sync with every write. Query an index to find the primary keys
+behind one value.
+
+This is release 0.7.0. It adds secondary indexes. An index writes into a
+reserved part of the log structured merge tree. The write ahead log keeps
+the index atomic with the data. Compaction drops stale index entries.
 
 ## Features
 
@@ -32,6 +35,9 @@ the number of fsync calls.
 - Point-in-time snapshots with consistent reads
 - Snapshot iterators that stay valid during writes
 - Range scans with an iterator API
+- Secondary indexes with automatic maintenance
+- JSON field indexes with one API call
+- Exact and range queries over an index
 - Crash recovery from the write ahead log
 - Local TCP server with a line protocol
 - Zero runtime dependencies
@@ -68,11 +74,11 @@ bin/cinderstore demo --no-checksums
 ## Demo output
 
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
-scans, flushes, compacts, deletes, snapshots, and reopens a database. The
-output is deterministic.
+scans, flushes, compacts, deletes, snapshots, and reopens a database. It
+creates secondary indexes and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.6.0 demo ==
+== Cinderstore 0.7.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -137,6 +143,19 @@ Database directory: ...\cinderstore-demo
    concurrent writes: 200, durability commits: 25
    all 200 rows recovered after a restart
 
+12. Secondary indexes track derived views
+   created indexes on name, price, and stock
+   query by-name "Ash Rake Forged"  => SKU-0010
+   query by-price "14.0"            => SKU-0010
+   query by-stock "31"              => SKU-0010
+   stock range 20 to 30               => SKU-0004, SKU-0023, SKU-0011, SKU-0003, SKU-0022, SKU-0006
+   update SKU-0010 price to 15.50, then flush and compact
+   query by-price "14.0"            => (none)
+   query by-price "15.5"            => SKU-0010
+   delete SKU-0011, then flush and compact
+   query by-name "Coal Shovel Small" => (none)
+   reopen and query by-stock "31"    => SKU-0010
+
 Demo complete.
 ```
 
@@ -156,6 +175,10 @@ Step 11 shows the value of batches and group commit. One batch writes 24 rows
 in a single log record. Eight writers share one durability sync per round.
 They write 200 rows with 25 syncs instead of 200. The store still recovers
 every row after a restart.
+
+Step 12 shows the value of secondary indexes. Three JSON indexes cover the
+catalog. A price update moves SKU-0010 between index keys. A delete removes
+SKU-0011 from its indexes. The store recovers every index after a restart.
 
 ## Use the library
 
@@ -247,6 +270,53 @@ db.each("SKU-0100", "SKU-0200") do |key, value|
 end
 ```
 
+### Use a secondary index
+
+Create an index with an extractor. The block gets the primary key and its
+value. It returns the index keys for that value.
+
+```crystal
+db.create_index("by-builder") do |key, value|
+  [extract_builder(value)]
+end
+```
+
+For JSON values, index one field with a name and a field name. A scalar
+field yields one index key. An array field yields one key per element.
+
+```crystal
+db.create_json_index("by-price", "price")
+db.create_json_index("by-name", "name")
+```
+
+Every put and delete updates each index. A value change moves its primary
+key between index keys. A delete removes the key from every index.
+
+Find the primary keys behind one index key.
+
+```crystal
+db.query("by-price", "14.0") # => ["SKU-0010"]
+```
+
+Find the primary keys behind a range of index keys. The range is
+`[start, finish)`.
+
+```crystal
+db.query_range("by-price", "10", "20") # => ["SKU-0022", "SKU-0010"]
+```
+
+Query a snapshot for a consistent result.
+
+```crystal
+db.snapshot do |snap|
+  snap.query("by-name", "Ash Rake Forged")
+end
+```
+
+A query reads the stored index entries. It works without a registered
+index in the current process. Index keys sort by byte value, like primary
+keys.
+
 Flush and compact explicitly.
 
 ```crystal
@@ -291,6 +361,18 @@ Scan a range.
 bin/cinderstore scan --start a --finish z --limit 100
 ```
 
+Query a secondary index.
+
+```console
+bin/cinderstore query --index by-price --key 14.0
+```
+
+Query an index range.
+
+```console
+bin/cinderstore query --index by-stock --start 20 --finish 30
+```
+
 Show counters.
 
 ```console
@@ -301,6 +383,12 @@ Start the local server.
 
 ```console
 bin/cinderstore server --db data --port 7654
+```
+
+Start the server with JSON field indexes.
+
+```console
+bin/cinderstore server --db data --port 7654 --index by-price:price
 ```
 
 Run the server in fast mode.
@@ -323,6 +411,8 @@ newlines. Values must not contain newlines.
 | `GET key` | Read a value |
 | `DEL key` | Delete a key |
 | `SCAN start finish limit` | List a range |
+| `QUERY index index_key` | Query one index key |
+| `QUERYRANGE index start finish` | Query an index range |
 | `STATS` | Show counters |
 | `PING` | Check the server |
 | `FLUSH` | Flush the memtable |
@@ -335,8 +425,13 @@ The server answers with one line per command.
 - `VALUE value` for a read
 - `NOT_FOUND` for a missing key
 - `ROW key value` for each scan result, then `END`
+- `ROW key` for each index query result, then `END`
 - `STATS {...}` for the counters
 - `ERR message` for an error
+
+A `QUERY` command returns the primary keys behind one index key. A
+`QUERYRANGE` command returns the primary keys behind a range of index keys.
+Both commands end with `END`.
 
 Use a tool such as `nc` or the included example client.
 
@@ -363,6 +458,10 @@ the CRC32 on new data.
 
 A batch follows the same path. Its entries become one log record. Group
 commit still applies, so a batch waits for the same shared fsync.
+
+A secondary index rides the same path. A write that changes an index appends
+one batch record. The record holds the primary entry and its index entries.
+The log keeps them atomic. A crash drops the whole record or nothing.
 
 ### Flush
 
@@ -406,6 +505,25 @@ can replace those files without breaking the snapshot.
 Snapshots never block writes. Reads over a snapshot use the same merge path
 as normal reads. Release a snapshot when you are done with it.
 
+### Secondary indexes
+
+An index entry is an ordinary entry in a reserved key namespace. The entry
+key holds the index name, the index key, and the primary key. The namespace
+uses the NUL byte, so it sorts before every user key.
+
+The store maintains each index during a write. It reads the previous value
+of the primary key. It runs the extractor on the old and the new value. A
+new index key becomes a live entry. A removed index key becomes a tombstone.
+
+The write ahead log keeps the primary entry and the index entries in one
+batch record. Recovery restores both together. A newer tombstone supersedes
+a stale entry, exactly as it does for primary keys. Compaction drops the
+stale entries.
+
+A query scans the index range in the merge path. It returns primary keys in
+index key order, then primary key order. User reads never see the index
+namespace. Scans, snapshots, and counters skip it.
+
 ### Read path
 
 A read merges the memory table, any frozen table, and all sorted tables. The
@@ -439,6 +557,10 @@ always carry checksums. The reader handles every layout, so an upgrade does
 not lose data.
 
 Sequence numbers make versions unique. They are per-write and never reused.
+
+Index entries use a reserved key namespace inside the tables. The manifest
+records how many index entries each table holds. Counters use this number
+to hide the internal entries.
 
 ## Configuration
 
@@ -479,6 +601,7 @@ src/cinderstore.cr       Library entry point
 src/cinderstore/         Core components
 src/cinderstore/batch.cr Atomic batch writes
 src/cinderstore/commit_group.cr  Shared durability syncs
+src/cinderstore/index.cr Secondary index namespace
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
@@ -489,25 +612,31 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It has 146 examples. All pass on Windows
+The suite runs with `crystal spec`. It has 172 examples. All pass on Windows
 and Linux. It covers the skip list, the memory table, the write ahead log,
 the bloom filter, and the block cache. It covers the tables, the iterators,
 and the database. It covers batch writes, group commit, compaction by level,
 durability, snapshots, and the server protocol. It covers both checksum
-modes and the legacy file layouts.
+modes and the legacy file layouts. It covers secondary index maintenance,
+queries, recovery, and snapshots.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
 
 ## Limitations
 
-- Keys sort by byte value.
+- Keys sort by byte value. Index keys sort the same way.
 - Values are limited to 4 MB.
 - Keys are limited to 4 KB.
+- Keys that start with the reserved index prefix are rejected.
+- Keys with a NUL byte cannot be indexed.
+- An index only covers writes made after it is created.
 - The server protocol is unencrypted. Use it on localhost only.
 - Fast mode cannot detect silent bit rot. It detects torn writes only.
 - Group commit needs concurrent writers to share a sync. A single writer
   still syncs once per write.
+- Index maintenance reads the previous value of each written key.
+- Indexers must be deterministic. The same value must give the same keys.
 - `compact_levels` merges a whole level at once. A very large level makes a
   large merge. The level targets keep that merge rare.
 - No multi-threaded runtime is required. The server uses fibers.
@@ -517,10 +646,13 @@ formatting, runs the suite, runs both demos, and builds the binary.
 
 Planned:
 
-- Release 0.7: secondary indexes
+- Release 0.8: streaming iterators for secondary index queries
 
 Delivered:
 
+- Release 0.7: secondary indexes. Index entries share the log structured
+  merge tree. The store maintains each index on every write. Queries return
+  the primary keys behind an index key.
 - Release 0.6: batch writes and group commit. A batch is one atomic write
   ahead log record. Concurrent writers share one durability sync per group.
 - Release 0.5: optional checksum-free fast mode. New data can skip CRC32

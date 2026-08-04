@@ -1,6 +1,7 @@
 require "./cinderstore/version"
 require "./cinderstore/errors"
 require "./cinderstore/util"
+require "./cinderstore/index"
 require "./cinderstore/entry"
 require "./cinderstore/skiplist"
 require "./cinderstore/memtable"

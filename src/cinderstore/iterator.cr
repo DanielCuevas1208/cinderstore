@@ -202,7 +202,8 @@ module Cinderstore
     end
   end
 
-  # Wraps an iterator and hides tombstone entries.
+  # Wraps an iterator and hides tombstone entries and internal index
+  # entries. User-facing reads never see the secondary index namespace.
   class LiveIter < Store::Iter
     def initialize(@inner : Store::Iter)
     end
@@ -213,6 +214,7 @@ module Cinderstore
 
     def next? : Entry?
       while entry = @inner.next?
+        next if Index.internal_key?(entry.key)
         return entry if entry.alive
       end
       nil

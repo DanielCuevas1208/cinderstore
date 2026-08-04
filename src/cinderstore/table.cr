@@ -5,8 +5,10 @@ module Cinderstore
     getter first : String
     getter last : String
     getter count : Int64
+    getter index_count : Int64
 
-    def initialize(@id : Int64, @first : String, @last : String, @count : Int64)
+    def initialize(@id : Int64, @first : String, @last : String, @count : Int64,
+                   @index_count : Int64 = 0_i64)
     end
   end
 
@@ -57,6 +59,7 @@ module Cinderstore
     @keys : Array(String)
     @index : Array(BlockIndexEntry)
     @count : Int64 = 0_i64
+    @index_count : Int64 = 0_i64
     @first : String?
     @last : String?
 
@@ -81,6 +84,7 @@ module Cinderstore
       @first = key if @first.nil?
       @last = key
       @count += 1
+      @index_count += 1 if Index.internal_key?(key)
       flush_block if @pending.size >= @block_size
     end
 
@@ -118,7 +122,7 @@ module Cinderstore
       @io.write_bytes(Util.crc32(footer_bytes), IO::ByteFormat::LittleEndian)
       @io.flush
 
-      TableMeta.new(@id, @first.not_nil!, @last.not_nil!, @count)
+      TableMeta.new(@id, @first.not_nil!, @last.not_nil!, @count, @index_count)
     end
 
     private def flush_block : Nil
