@@ -103,7 +103,7 @@ describe "Cinderstore compaction" do
     end
   end
 
-  it "handles many small flushes and a full merge" do
+  it "handles many small flushes and compacts them into one table" do
     config = Cinderstore::SpecHelpers.fast_config
     Cinderstore::SpecHelpers.with_db("compact-many", config) do |db, _path|
       6.times do |round|

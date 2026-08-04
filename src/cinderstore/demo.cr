@@ -25,6 +25,8 @@ module Cinderstore
       config = DB::Config.new
       config.sync_writes = false
       config.compact_on_flush = false
+      config.level_target_bytes = 2_048
+      config.level_ratio = 10
       db = DB.new(path, config)
 
       puts "== Cinderstore #{VERSION} demo =="
@@ -95,9 +97,31 @@ module Cinderstore
       snap.release
       puts ""
 
+      puts "8. Leveled compaction grows deeper levels"
+      puts "   Write 90 products across 3 flushes"
+      3.times do |batch|
+        30.times do |i|
+          index = batch * 30 + i
+          sku = "SKU-01%02d" % index
+          db.put(sku, %({"name":"Part #{index}","price":#{index + 1}.00,"stock":#{index}}))
+        end
+        db.flush
+      end
+      stats = db.stats
+      puts "   tables: #{stats.tables} (l0: #{stats.l0}, l1: #{stats.l1}), entries: #{stats.entries}"
+      db.compact
+      stats = db.stats
+      puts "   compact moved level 0 into level 1"
+      puts "   tables: #{stats.tables} (l0: #{stats.l0}, l1: #{stats.l1}), entries: #{stats.entries}"
+      db.compact
+      stats = db.stats
+      puts "   level 1 passed its target, so compact moved it to level 2"
+      puts "   tables: #{stats.tables} (l0: #{stats.l0}, l1: #{stats.l1}, l2: #{stats.levels[2]}), entries: #{stats.entries}"
+      puts ""
+
       db.close
 
-      puts "8. Reopen the database and verify recovery"
+      puts "9. Reopen the database and verify recovery"
       reopened = DB.new(path, config)
       count = reopened.scan.size
       puts "   rows after restart: #{count}"
