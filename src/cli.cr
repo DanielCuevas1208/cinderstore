@@ -25,6 +25,7 @@ module Cinderstore
       when "stats"         then run_simple("stats", args[1..])
       when "flush"         then run_simple("flush", args[1..])
       when "compact"       then run_simple("compact", args[1..])
+      when "verify"        then run_verify(args[1..])
       when "demo"          then run_demo(args[1..])
       when "help", "--help", "-h"
         print_help
@@ -263,6 +264,22 @@ module Cinderstore
       0
     end
 
+    private def run_verify(rest : Array(String)) : Int32
+      db_path = "cinderstore-data"
+      help = false
+      parser = OptionParser.new
+      parser.on("--db PATH", "Database directory") { |v| db_path = v }
+      parser.on("-h", "--help", "Show this help") { help = true }
+      parser.parse(rest)
+      if help
+        puts parser
+        return 0
+      end
+      report = DB.verify(db_path)
+      puts report
+      report.valid? ? 0 : 1
+    end
+
     private def run_demo(rest : Array(String)) : Int32
       db_path = nil
       fixture = nil
@@ -297,6 +314,7 @@ module Cinderstore
           stats       Show database counters
           flush       Flush the memtable to a table
           compact     Merge tables and drop stale data
+          verify      Check table and log integrity
           demo        Run a self-contained walkthrough
           help        Show this help
 

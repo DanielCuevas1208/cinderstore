@@ -128,6 +128,60 @@ module Cinderstore
       max_seq
     end
 
+    # Verifies every complete record in `path`.
+    def self.verify(path : String) : Int64
+      return 0_i64 unless File.exists?(path)
+      File.open(path, "r") do |io|
+        format = read_format(io)
+        records = 0_i64
+        while io.pos < io.size
+          body_len = Util.read_varint(io).to_i
+          if format.kind
+            raise CorruptDataError.new("empty wal record") if body_len < 1
+            kind = io.read_byte.not_nil!
+            body = Bytes.new(body_len - 1)
+            io.read_fully(body)
+            verify_checksum(io, kind, body) if format.checksums
+            verify_kind(kind, body)
+          else
+            body = Bytes.new(body_len)
+            io.read_fully(body)
+            verify_checksum(io, body) if format.checksums
+            verify_entry_body(body)
+          end
+          records += 1
+        end
+        records
+      end
+    end
+
+    private def self.verify_kind(kind : UInt8, body : Bytes) : Nil
+      case kind
+      when KIND_ENTRY
+        verify_entry_body(body)
+      when KIND_BATCH
+        io = IO::Memory.new(body)
+        count = Util.read_varint(io).to_i
+        raise CorruptDataError.new if count == 0
+        count.times { Cinderstore.read_entry(io) }
+        raise CorruptDataError.new unless io.pos == io.size
+      else
+        raise CorruptDataError.new
+      end
+    end
+
+    private def self.verify_entry_body(body : Bytes) : Nil
+      io = IO::Memory.new(body)
+      Cinderstore.read_entry(io)
+      raise CorruptDataError.new unless io.pos == io.size
+    end
+
+    private def self.verify_checksum(io : IO, body : Bytes) : Nil
+      stored_crc = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
+      actual_crc = Util.crc32(body)
+      raise CorruptDataError.new("wal checksum mismatch") unless stored_crc == actual_crc
+    end
+
     # Detects the record framing of a log and leaves `io` at the first
     # record. A version-2 header sets the mode from its flag byte. A legacy
     # version-1 log has no header, so its records are entries with

@@ -99,6 +99,48 @@ module Cinderstore
       end
     end
 
+    # Results from a read-only storage verification.
+    class VerificationReport
+      getter tables : Int32
+      getter table_entries : Int64
+      getter wal_files : Int32
+      getter wal_records : Int64
+      getter bytes_checked : Int64
+      getter errors : Array(String)
+
+      def initialize(@tables : Int32, @table_entries : Int64, @wal_files : Int32,
+                     @wal_records : Int64, @bytes_checked : Int64, @errors : Array(String))
+      end
+
+      def valid? : Bool
+        @errors.empty?
+      end
+
+      def to_h : Hash(String, Bool | Int32 | Int64 | Array(String))
+        {
+          "valid"         => valid?,
+          "tables"        => @tables,
+          "table_entries" => @table_entries,
+          "wal_files"     => @wal_files,
+          "wal_records"   => @wal_records,
+          "bytes_checked" => @bytes_checked,
+          "errors"        => @errors,
+        }
+      end
+
+      def to_json(io : IO) : Nil
+        to_h.to_json(io)
+      end
+
+      def to_s(io : IO) : Nil
+        io << "verification: #{valid? ? "valid" : "invalid"}\n"
+        io << "tables: #{@tables}, table entries: #{@table_entries}\n"
+        io << "wal files: #{@wal_files}, wal records: #{@wal_records}\n"
+        io << "bytes checked: #{@bytes_checked}"
+        @errors.each { |error| io << "\nerror: #{error}" }
+      end
+    end
+
     # A live reference to one sorted table file.
     class TableRef
       getter id : Int64
@@ -611,6 +653,134 @@ module Cinderstore
       end
     end
 
+    # Verifies a database directory without opening or recovering it.
+    #
+    # This entry point is safe for diagnostics because it does not remove
+    # orphan files, replay logs, or create a new active log.
+    def self.verify(path : String) : VerificationReport
+      errors = [] of String
+      table_entries = 0_i64
+      bytes_checked = 0_i64
+      table_infos = [] of Manifest::TableInfo
+      children = begin
+        Dir.children(path)
+      rescue ex : Exception
+        errors << "database directory: #{verification_error(ex)}"
+        [] of String
+      end
+
+      manifest_path = File.join(path, MANIFEST_NAME)
+      bytes_checked += verification_file_size(manifest_path)
+      if File.exists?(manifest_path)
+        begin
+          table_infos = Manifest.load(manifest_path).levels.flatten
+        rescue ex : Exception
+          errors << "#{MANIFEST_NAME}: #{verification_error(ex)}"
+        end
+      else
+        errors << "#{MANIFEST_NAME}: file is missing"
+      end
+
+      known_ids = table_infos.map(&.id)
+      table_infos.each do |info|
+        table_path = File.join(path, "#{Util.file_stem(info.id)}#{SST_SUFFIX}")
+        bytes_checked += verification_file_size(table_path)
+        reader : SstableReader? = nil
+        begin
+          reader = SstableReader.new(table_path, info.id)
+          actual = reader.not_nil!.verify
+          table_entries += actual.count
+          unless actual.id == info.id && actual.first == info.first &&
+                 actual.last == info.last && actual.count == info.count &&
+                 actual.index_count == info.index_count
+            errors << "#{File.basename(table_path)}: manifest metadata mismatch"
+          end
+        rescue ex : Exception
+          errors << "#{File.basename(table_path)}: #{verification_error(ex)}"
+        ensure
+          reader.try(&.close)
+        end
+      end
+
+      children.select { |name| name.ends_with?(SST_SUFFIX) }.sort.each do |name|
+        id = name.rpartition(".")[0].to_i64
+        unless known_ids.includes?(id)
+          errors << "#{name}: table is not listed in #{MANIFEST_NAME}"
+        end
+      end
+
+      wal_files = 0
+      wal_records = 0_i64
+      children.select { |name| name.ends_with?(WAL_SUFFIX) }.sort.each do |name|
+        wal_files += 1
+        wal_path = File.join(path, name)
+        bytes_checked += verification_file_size(wal_path)
+        begin
+          wal_records += Wal.verify(wal_path)
+        rescue ex : Exception
+          errors << "#{name}: #{verification_error(ex)}"
+        end
+      end
+
+      VerificationReport.new(table_infos.size.to_i32, table_entries, wal_files,
+        wal_records, bytes_checked, errors)
+    end
+
+    # Checks every manifest table and write ahead log without changing data.
+    #
+    # The check waits for an active flush, then blocks writes for its duration.
+    # It verifies table blocks, bloom filters, WAL framing, and manifest
+    # metadata. Fast-mode files can only be checked for layout, not bit rot.
+    def verify : VerificationReport
+      @flush_lock.synchronize do
+        @lock.synchronize do
+          check_open
+          errors = [] of String
+          table_refs = @levels.flatten
+          table_entries = 0_i64
+          bytes_checked = 0_i64
+          bytes_checked += file_size(File.join(@path, MANIFEST_NAME))
+
+          table_refs.each do |ref|
+            bytes_checked += file_size(ref.path)
+            reader : SstableReader? = nil
+            begin
+              # Use a fresh reader so verification bypasses caches and does
+              # not move the file position of a concurrent snapshot reader.
+              reader = SstableReader.new(ref.path, ref.id)
+              actual = reader.not_nil!.verify
+              table_entries += actual.count
+              unless actual.id == ref.id && actual.first == ref.first &&
+                     actual.last == ref.last && actual.count == ref.count &&
+                     actual.index_count == ref.index_count
+                errors << "#{File.basename(ref.path)}: manifest metadata mismatch"
+              end
+            rescue ex : Exception
+              errors << "#{File.basename(ref.path)}: #{verification_error(ex)}"
+            ensure
+              reader.try(&.close)
+            end
+          end
+
+          wal_files = 0
+          wal_records = 0_i64
+          Dir.children(@path).select { |name| name.ends_with?(WAL_SUFFIX) }.sort.each do |name|
+            wal_files += 1
+            path = File.join(@path, name)
+            bytes_checked += file_size(path)
+            begin
+              wal_records += Wal.verify(path)
+            rescue ex : Exception
+              errors << "#{name}: #{verification_error(ex)}"
+            end
+          end
+
+          VerificationReport.new(table_refs.size.to_i32, table_entries, wal_files,
+            wal_records, bytes_checked, errors)
+        end
+      end
+    end
+
     # Flushes pending work, syncs the manifest, and releases file handles.
     def close : Nil
       @flush_lock.synchronize do
@@ -1091,6 +1261,20 @@ module Cinderstore
     end
 
     private def file_size(path : String) : Int64
+      File.size(path)
+    rescue File::NotFoundError
+      0_i64
+    end
+
+    private def verification_error(error : Exception) : String
+      error.message || error.class.to_s
+    end
+
+    private def self.verification_error(error : Exception) : String
+      error.message || error.class.to_s
+    end
+
+    private def self.verification_file_size(path : String) : Int64
       File.size(path)
     rescue File::NotFoundError
       0_i64

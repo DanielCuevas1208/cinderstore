@@ -199,6 +199,40 @@ module Cinderstore
       Cinderstore.decode_entries(read_block(idx))
     end
 
+    # Verifies every block and returns the metadata found in the file.
+    def verify : TableMeta
+      raise CorruptDataError.new if @index.empty?
+      previous_key : String? = nil
+      first_key : String? = nil
+      last_key : String? = nil
+      count = 0_i64
+      index_count = 0_i64
+
+      @index.each_with_index do |block, index|
+        raise CorruptDataError.new if block.length == 0
+        raise CorruptDataError.new if block.offset >= @index_offset
+        raise CorruptDataError.new if block.length > @index_offset - block.offset
+        raise CorruptDataError.new if index > 0 && block.first_key <= @index[index - 1].first_key
+        # Bypass the block cache. Verification must inspect the bytes on
+        # disk, even when a normal read already cached this block.
+        entries = Cinderstore.decode_entries(read_block_raw(block))
+        raise CorruptDataError.new if entries.empty?
+        raise CorruptDataError.new unless entries.first.key == block.first_key
+
+        entries.each do |entry|
+          raise CorruptDataError.new if previous_key && entry.key <= previous_key.not_nil!
+          raise CorruptDataError.new unless bloom_may_contain?(entry.key)
+          previous_key = entry.key
+          first_key ||= entry.key
+          last_key = entry.key
+          count += 1
+          index_count += 1 if Index.internal_key?(entry.key)
+        end
+      end
+
+      TableMeta.new(@file_id, first_key.not_nil!, last_key.not_nil!, count, index_count)
+    end
+
     # Returns the index of the block that may contain `key`.
     #
     # Returns the last block whose first key is <= `key`, or block zero.

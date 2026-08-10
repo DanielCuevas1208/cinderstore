@@ -266,6 +266,14 @@ module Cinderstore
       prefix_iter.each { |key, _value| prefix_keys << key }
       prefix_iter.close
       puts "   live prefix SKU-001 => #{format_keys(prefix_keys)}"
+      puts ""
+
+      puts "16. Verify persistent files without changing them"
+      report = reopened.verify
+      puts "   valid: #{report.valid?}"
+      puts "   tables checked: #{report.tables}, WAL files checked: #{report.wal_files}"
+      puts "   table entries: #{report.table_entries}, WAL records: #{report.wal_records}"
+      puts "   bytes checked: #{report.bytes_checked}"
       reopened.close
       puts ""
 

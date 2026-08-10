@@ -17,8 +17,11 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.10.0. It adds prefix scans. A prefix scan returns live
-key/value pairs whose keys start with the prefix bytes.
+This is release 0.11.0. It adds read-only storage verification. The check
+covers sorted tables, write ahead logs, and manifest metadata.
+
+Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
+whose keys start with the prefix bytes.
 
 Prefix scans return arrays or streaming iterators. They use the existing
 ordered merge path. Database iterators own snapshots. Snapshot iterators borrow
@@ -56,6 +59,7 @@ atomic with the data. Compaction drops stale index entries.
 - Exact and range queries over an index
 - Streaming iterators for exact and range index queries
 - Crash recovery from the write ahead log
+- Read-only storage verification for tables and write ahead logs
 - Local TCP server with a line protocol
 - Zero runtime dependencies
 
@@ -95,7 +99,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates secondary indexes and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.10.0 demo ==
+== Cinderstore 0.11.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -186,6 +190,12 @@ Database directory: ...\cinderstore-demo
 15. Prefix scans group keys
    live prefix SKU-001 => SKU-0013, SKU-0014, SKU-0015
 
+16. Read-only storage verification
+   valid: true
+   tables checked: 1, WAL files checked: 1
+   table entries: 92, WAL records: 1
+   bytes checked: <persistent file bytes>
+
 Demo complete.
 ```
 
@@ -221,6 +231,9 @@ The snapshot iterator borrows its snapshot. A delete does not change its view.
 
 Step 15 shows prefix scans. The scan starts at the prefix and stops at its
 byte successor. The iterator filters the range when no successor exists.
+
+Step 16 shows storage verification. The check reads every persistent table
+and log. It reports corruption and metadata mismatches without repair.
 
 ## Use the library
 
@@ -456,6 +469,22 @@ pass touches only two levels. It returns true when any table moved.
 moved = db.compact_levels
 ```
 
+### Verify storage
+
+Check persistent files without changing them.
+
+```crystal
+report = db.verify
+raise "storage check failed" unless report.valid?
+puts report
+```
+
+The report checks table blocks, bloom filters, WAL records, and manifest
+metadata. It returns errors instead of changing files.
+
+Use `DB.verify("data")` when the database is closed. This form does not open,
+recover, or remove files.
+
 ## Command line tool
 
 The tool uses a database directory. The default directory is
@@ -507,6 +536,12 @@ Show counters.
 
 ```console
 bin/cinderstore stats
+```
+
+Verify persistent files.
+
+```console
+bin/cinderstore verify --db data
 ```
 
 Start the local server.
@@ -674,6 +709,15 @@ On open, the database replays the write ahead log into the memory table.
 Recovery is idempotent. A torn tail is detected by its CRC32 and skipped.
 The manifest lists every table. Orphan files from a crash are removed.
 
+### Verification
+
+`DB#verify` waits for a flush, then blocks writes during the check. It uses
+fresh readers, so cached blocks do not hide file corruption. Fast-mode files
+still allow layout checks, but they cannot expose silent bit rot.
+
+The check compares each table with its manifest entry. It verifies every WAL
+record and checksum. The CLI returns exit code 1 when the report is invalid.
+
 ## On-disk format
 
 Tables use a compact binary format.
@@ -752,20 +796,18 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 194 examples. It covers the
+The suite runs with `crystal spec`. It contains 198 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
-It covers streaming index queries, range scans, and prefix scans.
+It covers streaming index queries, range scans, prefix scans, and verification.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
 
-Current verification:
+Local validation for this release:
 
-- Formatting: passed locally.
-- Library and CLI type check: passed locally with `--no-codegen`.
-- Full specs and binary link: blocked locally by the restricted MSVC linker.
-- Earlier PR run: failed only at the binary build because `src/cli.cr` closed
-  a nullable scan iterator.
+- Formatting passed with `crystal tool format --check`.
+- No-codegen type checks passed for the CLI, demos, and all 20 spec files.
+- Full specs and production builds are blocked by restricted Windows process pipes in the MSVC toolchain.
 
 ## Limitations
 
@@ -787,11 +829,14 @@ Current verification:
 - Release snapshots before you close the database.
 - `scan_iter` has no built-in limit. Stop reading when you reach your limit.
 - A database-level scan, prefix, or query iterator holds a snapshot until you close it.
+- Verification does not inspect the active in-memory table.
 
 ## Roadmap
 
 Complete:
 
+- Release 0.11: read-only storage verification. The check covers tables, WALs,
+  and manifest metadata without repairing files.
 - Release 0.10: primary-key prefix scans. Materialized scans and streaming
   iterators use one ordered merge path. Snapshot iterators borrow snapshots.
 - Release 0.9: streaming primary-key range iterators. A database-level iterator
