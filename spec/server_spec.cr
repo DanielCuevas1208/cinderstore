@@ -53,13 +53,41 @@ describe Cinderstore::Server do
         send_command(sock, "PUT b two").should eq("OK")
         send_command(sock, "PUT c three").should eq("OK")
 
-        sock << "SCAN a c\n"
+        sock << "SCAN a c 2\n"
         sock.flush
         rows = [] of String
         while (line = sock.gets) && line != "END"
           rows << line
         end
         rows.should eq(["ROW a one", "ROW b two"])
+        sock.close
+      end
+    end
+  end
+
+  it "streams a prefix scan and validates its limit" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("server-prefix", config) do |db, _path|
+      db.put("forge-a", "one")
+      db.put("forge-b", "two")
+      db.put("other", "three")
+      with_server(db) do |server|
+        sock = TCPSocket.new("127.0.0.1", server.port)
+        sock << "SCANPREFIX forge- 1\n"
+        sock.flush
+        rows = [] of String
+        while (line = sock.gets) && line != "END"
+          rows << line
+        end
+        rows.should eq(["ROW forge-a one"])
+
+        sock << "SCANPREFIX forge- 0\n"
+        sock.flush
+        sock.gets.should eq("END")
+
+        sock << "SCANPREFIX forge- nope\n"
+        sock.flush
+        sock.gets.not_nil!.should start_with("ERR limit must be an integer")
         sock.close
       end
     end

@@ -1,7 +1,7 @@
 require "socket"
 
 module Cinderstore
-  # A local TCP server that exposes get, put, and delete.
+  # A local TCP server that exposes reads, writes, and maintenance commands.
   #
   # Each client connection runs in its own fiber. Commands are newline
   # terminated. See the README for the full protocol reference.
@@ -60,7 +60,9 @@ module Cinderstore
           begin
             command = parse_command(line)
             shutdown = true if command.op == "SHUTDOWN"
-            if command.op == "QUERY" || command.op == "QUERYRANGE"
+            if command.op == "SCAN" || command.op == "SCANPREFIX"
+              stream_scan(client, command)
+            elsif command.op == "QUERY" || command.op == "QUERYRANGE"
               stream_index_query(client, command)
             else
               response = execute(command)
@@ -93,10 +95,16 @@ module Cinderstore
         Command.new(op, parts[1], nil, "", nil, -1)
       when "SCAN"
         tokens = line.split(" ")
+        raise ProtocolError.new("too many arguments") if tokens.size > 4
         start = tokens[1]? || ""
         finish = tokens[2]?
-        limit = tokens[3]?.try(&.to_i?) || -1
+        limit = parse_limit(tokens[3]?)
         Command.new(op, "", nil, start, finish, limit)
+      when "SCANPREFIX"
+        tokens = line.split(" ")
+        raise ProtocolError.new("missing prefix") if tokens.size < 2
+        raise ProtocolError.new("too many arguments") if tokens.size > 3
+        Command.new(op, "", nil, tokens[1], nil, parse_limit(tokens[2]?))
       when "QUERY"
         raise ProtocolError.new("missing index") if parts.size < 2
         raise ProtocolError.new("missing index key") if parts.size < 3
@@ -126,18 +134,6 @@ module Cinderstore
       when "DEL", "DELETE"
         @db.delete(command.key)
         "OK"
-      when "SCAN"
-        rows = @db.scan(command.start, command.finish, command.limit)
-        if rows.empty?
-          "END"
-        else
-          String.build do |s|
-            rows.each do |key, value|
-              s << "ROW #{key} #{value}\n"
-            end
-            s << "END"
-          end
-        end
       when "STATS"
         "STATS #{@db.stats.to_json}"
       when "PING"
@@ -153,6 +149,31 @@ module Cinderstore
         "BYE"
       else
         raise ProtocolError.new("unknown command")
+      end
+    end
+
+    # Streams a primary-key scan as one ROW line per live pair, then END.
+    # The iterator owns a snapshot, so writes after the command starts do not
+    # change the result. A limit stops the iterator before the next row.
+    private def stream_scan(client : TCPSocket, command : Command) : Nil
+      iter = if command.op == "SCANPREFIX"
+               @db.scan_prefix_iter(command.start)
+             else
+               @db.scan_iter(command.start, command.finish)
+             end
+      count = 0
+      begin
+        while command.limit < 0 || count < command.limit
+          pair = iter.next?
+          break unless pair
+          client << "ROW #{pair[0]} #{pair[1]}\n"
+          client.flush
+          count += 1
+        end
+        client << "END\n"
+        client.flush
+      ensure
+        iter.close
       end
     end
 
@@ -175,6 +196,14 @@ module Cinderstore
       ensure
         iter.close
       end
+    end
+
+    private def parse_limit(value : String?) : Int32
+      return -1 unless value
+      limit = value.to_i?
+      raise ProtocolError.new("limit must be an integer") unless limit
+      raise ProtocolError.new("limit must not be less than -1") if limit < -1
+      limit
     end
   end
 end

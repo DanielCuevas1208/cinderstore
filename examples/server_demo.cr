@@ -30,6 +30,12 @@ puts "GET forge-hammer => #{send(sock, "GET forge-hammer")}"
 puts "GET missing      => #{send(sock, "GET nope")}"
 puts "DEL forge-tongs  => #{send(sock, "DEL forge-tongs")}"
 puts "STATS            => #{send(sock, "STATS")}"
+sock << "SCANPREFIX forge- 1\n"
+sock.flush
+while line = sock.gets
+  puts "SCANPREFIX       => #{line}"
+  break if line == "END"
+end
 puts "SHUTDOWN         => #{send(sock, "SHUTDOWN")}"
 sock.close
 
