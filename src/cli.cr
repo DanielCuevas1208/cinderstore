@@ -22,6 +22,7 @@ module Cinderstore
       when "del", "delete" then run_delete(args[1..])
       when "scan"          then run_scan(args[1..])
       when "query"         then run_query(args[1..])
+      when "export"        then run_export(args[1..])
       when "stats"         then run_simple("stats", args[1..])
       when "flush"         then run_simple("flush", args[1..])
       when "compact"       then run_simple("compact", args[1..])
@@ -264,6 +265,30 @@ module Cinderstore
       0
     end
 
+    private def run_export(rest : Array(String)) : Int32
+      db_path = "cinderstore-data"
+      destination = ""
+      help = false
+      parser = OptionParser.new
+      parser.on("--db PATH", "Source database directory") { |v| db_path = v }
+      parser.on("--output PATH", "New export directory") { |v| destination = v }
+      parser.on("-h", "--help", "Show this help") { help = true }
+      parser.parse(rest)
+      if help
+        puts parser
+        return 0
+      end
+      raise Error.new("missing --output") if destination.empty?
+      db = DB.new(db_path)
+      begin
+        rows = db.export(destination)
+        puts "exported #{rows} rows to #{destination}"
+      ensure
+        db.close
+      end
+      0
+    end
+
     private def run_verify(rest : Array(String)) : Int32
       db_path = "cinderstore-data"
       help = false
@@ -311,6 +336,7 @@ module Cinderstore
           del         Delete a key
           scan        List keys in a range
           query       Find primary keys through a secondary index
+          export      Copy a consistent snapshot to a new directory
           stats       Show database counters
           flush       Flush the memtable to a table
           compact     Merge tables and drop stale data

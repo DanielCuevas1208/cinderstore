@@ -17,8 +17,8 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.12.0. It streams primary-key scans over the local protocol.
-It adds bounded range scans and prefix scans without materializing result arrays.
+This is release 0.13.0. It adds consistent snapshot export for backups and migrations.
+The export streams primary rows into a new database directory.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
 whose keys start with the prefix bytes.
@@ -59,6 +59,7 @@ atomic with the data. Compaction drops stale index entries.
 - JSON field indexes with one API call
 - Exact and range queries over an index
 - Streaming iterators for exact and range index queries
+- Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
 - Read-only storage verification for tables and write ahead logs
 - Local TCP server with a line protocol
@@ -106,7 +107,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates secondary indexes and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.12.0 demo ==
+== Cinderstore 0.13.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -203,6 +204,10 @@ Database directory: ...\cinderstore-demo
    table entries: 92, WAL records: 1
    bytes checked: <persistent file bytes>
 
+17. Export a consistent snapshot
+   exported rows: 22
+   reopened export rows: 22
+
 Demo complete.
 ```
 
@@ -242,6 +247,9 @@ byte successor. The iterator filters the range when no successor exists.
 Step 16 shows storage verification. The check reads every persistent table
 and log. It reports corruption and metadata mismatches without repair.
 
+Step 17 shows snapshot export. The export copies live primary rows into a new
+database. The reopened copy keeps the same logical row count.
+
 ## Wire demo
 
 The wire demo starts a local server, writes two values, reads them, deletes one, and streams a prefix scan.
@@ -277,6 +285,19 @@ db.scan("a", "z").each do |key, value|
 end
 db.close
 ```
+
+### Export a consistent snapshot
+
+Export copies live primary rows into a new database directory.
+The source keeps serving reads and writes during the export.
+
+```crystal
+rows = db.export("backups/catalog")
+puts "exported #{rows} rows"
+```
+
+The export reads one snapshot. It streams rows in bounded batches.
+The destination must not exist before the call.
 
 ### Write a batch
 
@@ -566,6 +587,12 @@ Verify persistent files.
 bin/cinderstore verify --db data
 ```
 
+Export a consistent snapshot.
+
+```console
+bin/cinderstore export --db data --output backups/catalog
+```
+
 Start the local server.
 
 ```console
@@ -728,6 +755,13 @@ A query scans the index range in the merge path. It returns primary keys in
 index key order, then primary key order. User reads never see the index
 namespace. Scans, snapshots, and counters skip it.
 
+### Exports
+
+An export opens one snapshot before it reads any rows.
+The snapshot keeps table files alive during compaction.
+The exporter streams primary rows into bounded write batches.
+The destination contains primary key/value pairs only.
+
 ### Read path
 
 A read merges the memory table, any frozen table, and all sorted tables. The
@@ -823,14 +857,15 @@ src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
 examples/server_demo.cr  Wire protocol walkthrough
 fixtures/catalog.csv     Sample product catalog
+spec/export_spec.cr      Export and flush regression tests
 spec/                    Test suite
 ```
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 199 examples. It covers the
+The suite runs with `crystal spec`. It contains 203 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
-It covers streaming index queries, range scans, prefix scans, and verification.
+It covers streaming queries, range scans, prefix scans, exports, and verification.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -838,7 +873,7 @@ formatting, runs the suite, runs both demos, and builds the binary.
 Local validation for this release:
 
 - Formatting passed with `crystal tool format --check`.
-- No-codegen type checks passed for the CLI, demos, and all 21 spec files.
+- No-codegen type checks passed for the CLI, demos, and all 22 spec files.
 - Full specs and production builds are blocked by restricted Windows process pipes in the MSVC toolchain.
 
 ## Limitations
@@ -863,12 +898,16 @@ Local validation for this release:
 - A database-level scan, prefix, or query iterator holds a snapshot until you close it.
 - A wire scan holds a snapshot until it sends `END` or reaches its limit.
 - Wire scan limits must be `-1` or greater.
+- An export destination must not exist.
+- Exports copy primary rows only. Register indexes again on the destination.
+- A failed export can leave a partial destination.
 - Verification does not inspect the active in-memory table.
 
 ## Roadmap
 
 Complete:
 
+- Release 0.13: consistent snapshot export to a new database directory.
 - Release 0.12: streaming primary-key range and prefix scans over the local
   protocol. Limits stop iterators before the next row.
 - Release 0.11: read-only storage verification. The check covers tables, WALs,

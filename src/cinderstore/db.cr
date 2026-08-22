@@ -15,6 +15,7 @@ module Cinderstore
     MAX_TABLE_ENTRIES = 20_000
     MAX_KEY_BYTES     =   4096
     MAX_VALUE_BYTES   = 4 * 1024 * 1024
+    EXPORT_BATCH_SIZE = 256
 
     # Tuning options for a database instance.
     class Config
@@ -416,6 +417,7 @@ module Cinderstore
         @writes += 1
       end
       commit_wal(wal.not_nil!)
+      trigger_flush
     end
 
     # Applies `batch` atomically.
@@ -619,6 +621,41 @@ module Cinderstore
         yield snap
       ensure
         snap.release
+      end
+    end
+
+    # Copies the live primary key/value pairs from one consistent snapshot
+    # into a new database directory. The destination must not exist.
+    #
+    # The export streams the source snapshot and writes bounded batches. It
+    # returns the number of primary rows copied. Secondary index definitions
+    # are not persisted, so create them again on the destination when needed.
+    def export(destination : String, config : Config = Config.new) : Int64
+      raise Error.new("export destination already exists: #{destination}") if File.exists?(destination)
+
+      view = snapshot
+      target : DB? = nil
+      iterator : ScanIter? = nil
+      copied = 0_i64
+      batch = Batch.new
+      begin
+        target = DB.new(destination, config)
+        iterator = view.scan_iter
+        while pair = iterator.not_nil!.next?
+          batch.put(pair[0], pair[1])
+          copied += 1
+          if batch.size >= EXPORT_BATCH_SIZE
+            target.not_nil!.write(batch)
+            batch = Batch.new
+          end
+        end
+        target.not_nil!.write(batch) unless batch.empty?
+        target.not_nil!.flush
+        copied
+      ensure
+        iterator.try(&.close)
+        view.release
+        target.try(&.close)
       end
     end
 

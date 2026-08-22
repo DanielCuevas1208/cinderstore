@@ -277,6 +277,22 @@ module Cinderstore
       reopened.close
       puts ""
 
+      puts "17. Export a consistent snapshot"
+      export_path = File.join(Dir.tempdir, "cinderstore-export-demo")
+      FileUtils.rm_rf(export_path) if File.exists?(export_path)
+      export_config = DB::Config.new
+      export_config.sync_writes = false
+      export_config.compact_on_flush = false
+      export_config.checksums = @checksums
+      export_source = DB.new(index_path, export_config)
+      exported = export_source.export(export_path, export_config)
+      export_source.close
+      export_db = DB.new(export_path, export_config)
+      puts "   exported rows: #{exported}"
+      puts "   reopened export rows: #{export_db.scan.size}"
+      export_db.close
+      puts ""
+
       puts "Demo complete."
       0
     end
