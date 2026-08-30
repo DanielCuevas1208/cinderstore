@@ -195,14 +195,14 @@ module Cinderstore
       index_config.sync_writes = false
       index_config.compact_on_flush = false
       index_db = DB.new(index_path, index_config)
-      index_db.create_json_index("by-name", "name")
-      index_db.create_json_index("by-price", "price")
-      index_db.create_json_index("by-stock", "stock")
       catalog.each do |sku, name, price, stock|
         index_db.put(sku, %({"name":"#{name}","price":#{price},"stock":#{stock}}))
       end
       index_db.flush
-      puts "   created indexes on name, price, and stock"
+      index_db.create_json_index("by-name", "name")
+      index_db.create_json_index("by-price", "price")
+      index_db.create_json_index("by-stock", "stock")
+      puts "   created and backfilled indexes on name, price, and stock"
       puts "   query by-name \"Ash Rake Forged\"  => #{format_keys(index_db.query("by-name", "Ash Rake Forged"))}"
       puts "   query by-price \"14.0\"            => #{format_keys(index_db.query("by-price", "14.0"))}"
       puts "   query by-stock \"31\"              => #{format_keys(index_db.query("by-stock", "31"))}"

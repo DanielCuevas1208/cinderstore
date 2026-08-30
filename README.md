@@ -17,8 +17,8 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.13.0. It adds consistent snapshot export for backups and migrations.
-The export streams primary rows into a new database directory.
+This is release 0.14.0. It adds index backfill and durable JSON index definitions.
+JSON index definitions also travel with snapshot exports.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
 whose keys start with the prefix bytes.
@@ -56,7 +56,8 @@ atomic with the data. Compaction drops stale index entries.
 - Streaming primary-key prefix scans
 - Streaming primary-key scans over the local protocol
 - Secondary indexes with automatic maintenance
-- JSON field indexes with one API call
+- Index creation backfills existing primary rows
+- JSON field indexes with durable definitions
 - Exact and range queries over an index
 - Streaming iterators for exact and range index queries
 - Consistent snapshot export to a new database directory
@@ -104,10 +105,10 @@ crystal run examples/server_demo.cr
 
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
 scans, flushes, compacts, deletes, snapshots, and reopens a database. It
-creates secondary indexes and queries them. The output is deterministic.
+creates indexes after loading data and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.13.0 demo ==
+== Cinderstore 0.14.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -173,7 +174,7 @@ Database directory: ...\cinderstore-demo
    all 200 rows recovered after a restart
 
 12. Secondary indexes track derived views
-   created indexes on name, price, and stock
+   created and backfilled indexes on name, price, and stock
    query by-name "Ash Rake Forged"  => SKU-0010
    query by-price "14.0"            => SKU-0010
    query by-stock "31"              => SKU-0010
@@ -229,8 +230,8 @@ They write 200 rows with 25 syncs instead of 200. The store still recovers
 every row after a restart.
 
 Step 12 shows the value of secondary indexes. Three JSON indexes cover the
-catalog. A price update moves SKU-0010 between index keys. A delete removes
-SKU-0011 from its indexes. The store recovers every index after a restart.
+catalog. Creation backfills the existing rows. A price update moves SKU-0010
+between index keys. The store recovers index maintenance after a restart.
 
 Step 13 shows the value of streaming iterators. An exact query streams its
 matches one at a time. A range query stops early after three rows. A
@@ -247,8 +248,8 @@ byte successor. The iterator filters the range when no successor exists.
 Step 16 shows storage verification. The check reads every persistent table
 and log. It reports corruption and metadata mismatches without repair.
 
-Step 17 shows snapshot export. The export copies live primary rows into a new
-database. The reopened copy keeps the same logical row count.
+Step 17 shows snapshot export. The export copies live primary rows and JSON index
+definitions into a new database. The reopened copy keeps the same row count.
 
 ## Wire demo
 
@@ -288,8 +289,8 @@ db.close
 
 ### Export a consistent snapshot
 
-Export copies live primary rows into a new database directory.
-The source keeps serving reads and writes during the export.
+Export copies live primary rows and persisted JSON index definitions into a new
+database directory. The source keeps serving reads and writes during the export.
 
 ```crystal
 rows = db.export("backups/catalog")
@@ -297,7 +298,7 @@ puts "exported #{rows} rows"
 ```
 
 The export reads one snapshot. It streams rows in bounded batches.
-The destination must not exist before the call.
+The destination must not exist before the call. Custom index blocks are not copied.
 
 ### Write a batch
 
@@ -434,6 +435,9 @@ db.create_json_index("by-name", "name")
 
 Every put and delete updates each index. A value change moves its primary
 key between index keys. A delete removes the key from every index.
+
+Index creation scans existing primary rows. JSON index definitions persist in
+the manifest and restore maintenance after a restart.
 
 Find the primary keys behind one index key.
 
@@ -751,6 +755,12 @@ batch record. Recovery restores both together. A newer tombstone supersedes
 a stale entry, exactly as it does for primary keys. Compaction drops the
 stale entries.
 
+Creating an index scans current primary rows. Missing associations become live
+entries. Stale associations become tombstones.
+
+JSON definitions live in the manifest. Reopening restores their indexers.
+Custom extractors remain process-local.
+
 A query scans the index range in the merge path. It returns primary keys in
 index key order, then primary key order. User reads never see the index
 namespace. Scans, snapshots, and counters skip it.
@@ -760,7 +770,7 @@ namespace. Scans, snapshots, and counters skip it.
 An export opens one snapshot before it reads any rows.
 The snapshot keeps table files alive during compaction.
 The exporter streams primary rows into bounded write batches.
-The destination contains primary key/value pairs only.
+The destination contains primary rows and persisted JSON index definitions.
 
 ### Read path
 
@@ -853,6 +863,7 @@ src/cinderstore/index_query.cr  Streaming index query iterators
 src/cinderstore/scan_iter.cr    Streaming primary-key range and prefix iterators
 src/cinderstore/util.cr    Prefix range upper bounds
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
+src/cinderstore/manifest.cr  Durable tables and JSON index definitions
 src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
 examples/server_demo.cr  Wire protocol walkthrough
@@ -863,7 +874,7 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 203 examples. It covers the
+The suite runs with `crystal spec`. It contains 205 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
 It covers streaming queries, range scans, prefix scans, exports, and verification.
 
@@ -883,12 +894,14 @@ Local validation for this release:
 - Keys are limited to 4 KB.
 - Keys that start with the reserved index prefix are rejected.
 - Keys with a NUL byte cannot be indexed.
-- An index only covers writes made after it is created.
+- JSON index definitions survive a restart.
+- Custom index blocks need registration after each restart.
 - The server protocol is unencrypted. Use it on localhost only.
 - Fast mode cannot detect silent bit rot. It detects torn writes only.
 - Group commit needs concurrent writers to share a sync. A single writer
   still syncs once per write.
 - Index maintenance reads the previous value of each written key.
+- Index creation scans all live rows while holding the database lock.
 - Indexers must be deterministic. The same value must give the same keys.
 - `compact_levels` merges a whole level at once. A very large level makes a
   large merge. The level targets keep that merge rare.
@@ -899,7 +912,8 @@ Local validation for this release:
 - A wire scan holds a snapshot until it sends `END` or reaches its limit.
 - Wire scan limits must be `-1` or greater.
 - An export destination must not exist.
-- Exports copy primary rows only. Register indexes again on the destination.
+- Exports copy primary rows and persisted JSON index definitions.
+- Custom index blocks are not copied during export.
 - A failed export can leave a partial destination.
 - Verification does not inspect the active in-memory table.
 
@@ -907,6 +921,7 @@ Local validation for this release:
 
 Complete:
 
+- Release 0.14: index creation backfills existing rows. JSON definitions survive restart and export.
 - Release 0.13: consistent snapshot export to a new database directory.
 - Release 0.12: streaming primary-key range and prefix scans over the local
   protocol. Limits stop iterators before the next row.

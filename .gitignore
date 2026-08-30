@@ -4,6 +4,7 @@
 /.shards/
 
 /.crystal/
+/.crystal-cache/
 # Crystal
 *.dwarf
 *.dwarf.*

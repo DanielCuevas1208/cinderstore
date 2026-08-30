@@ -245,30 +245,22 @@ module Cinderstore
     #
     # The block receives the primary key and its value. It returns the
     # index keys that identify the value. The store maintains the index
-    # on every write. Call `query` to find the primary keys that share an
-    # index key.
+    # on every write. Creation also backfills existing rows.
+    # Call `query` to find the primary keys that share an index key.
     def create_index(name : String, &indexer : String, String -> Array(String)) : Nil
-      validate_index_name(name)
-      @lock.synchronize do
-        check_open
-        raise InvalidIndexError.new("index already exists: #{name}") if @indexers.has_key?(name)
-        @indexers[name] = indexer
-      end
+      register_index(name, indexer)
     end
 
     # Registers an index that reads one JSON field from every value.
     #
     # A scalar field yields one index key. An array field yields one key
     # per element. A value that is not JSON, or that lacks the field,
-    # yields no index keys. The indexer never fails a write.
+    # yields no index keys. Creation backfills existing rows.
+    # The indexer never fails a write.
     def create_json_index(name : String, field : String) : Nil
       raise InvalidIndexError.new("field must not be empty") if field.empty?
-      create_index(name) do |_key, value|
-        doc = JSON.parse(value)
-        Index.json_field_keys(doc, field)
-      rescue JSON::ParseException
-        [] of String
-      end
+      indexer = ->(_key : String, value : String) { json_index_keys(value, field) }
+      register_index(name, indexer, Manifest::IndexInfo.new(name, field))
     end
 
     # Returns true when `name` is a registered index.
@@ -628,8 +620,8 @@ module Cinderstore
     # into a new database directory. The destination must not exist.
     #
     # The export streams the source snapshot and writes bounded batches. It
-    # returns the number of primary rows copied. Secondary index definitions
-    # are not persisted, so create them again on the destination when needed.
+    # returns the number of primary rows copied. Persisted JSON index definitions
+    # are copied to the destination. Custom index blocks remain process-local.
     def export(destination : String, config : Config = Config.new) : Int64
       raise Error.new("export destination already exists: #{destination}") if File.exists?(destination)
 
@@ -640,6 +632,12 @@ module Cinderstore
       batch = Batch.new
       begin
         target = DB.new(destination, config)
+        index_definitions = @lock.synchronize do
+          @manifest.not_nil!.indexes.map { |definition| {definition.name, definition.field} }
+        end
+        index_definitions.each do |name, field|
+          target.not_nil!.create_json_index(name, field)
+        end
         iterator = view.scan_iter
         while pair = iterator.not_nil!.next?
           batch.put(pair[0], pair[1])
@@ -916,6 +914,93 @@ module Cinderstore
       end
     end
 
+    # Registers an index and backfills associations for existing rows.
+    private def register_index(name : String, indexer : Proc(String, String, Array(String)),
+                               definition : Manifest::IndexInfo? = nil) : Nil
+      validate_index_name(name)
+      wal : Wal::Writer? = nil
+      @lock.synchronize do
+        check_open
+        raise InvalidIndexError.new("index already exists: #{name}") if @indexers.has_key?(name)
+        @indexers[name] = indexer
+        begin
+          wal = backfill_index(name, indexer)
+        rescue ex
+          @indexers.delete(name)
+          raise ex
+        end
+      end
+
+      commit_wal(wal.not_nil!) if wal
+      @lock.synchronize do
+        check_open
+        if info = definition
+          @manifest.not_nil!.indexes << info
+        end
+        save_manifest
+      end
+      trigger_flush
+    end
+
+    # Reconciles one index with the current live primary rows.
+    #
+    # The caller holds the database lock. Missing associations become live
+    # entries. Stale associations become tombstones in one WAL batch.
+    private def backfill_index(name : String, indexer : Proc(String, String, Array(String))) : Wal::Writer?
+      desired = {} of String => Bool
+      collect_range("", nil, -1).each do |key, value|
+        raise InvalidKeyError.new("keys with a NUL byte cannot be indexed") if key.includes?(Index::SEP)
+        indexer.call(key, value).each do |index_key|
+          raise InvalidIndexError.new("index key for #{name} contains a NUL byte") if index_key.includes?(Index::SEP)
+          next if index_key.empty?
+          desired[Index.entry_key(name, index_key, key)] = true
+        end
+      end
+
+      existing = {} of String => Bool
+      prefix = Index.name_prefix(name)
+      iter = make_merge_iter(prefix, false)
+      while entry = iter.next?
+        break unless entry.key.starts_with?(prefix)
+        existing[entry.key] = true if entry.alive
+      end
+
+      pending = [] of Tuple(String, Bool)
+      desired.each_key do |entry_key|
+        pending << {entry_key, true} unless existing.has_key?(entry_key)
+      end
+      existing.each_key do |entry_key|
+        pending << {entry_key, false} unless desired.has_key?(entry_key)
+      end
+      return nil if pending.empty?
+
+      @seq += 1
+      seq = @seq
+      entries = [] of Entry
+      pending.each do |entry_key, alive|
+        entries << Entry.new(entry_key, seq, alive, "")
+      end
+      wal = @wal.not_nil!
+      wal.append_batch(entries)
+      entries.each do |entry|
+        if entry.alive
+          @mem.put(entry.key, entry.value, entry.seq)
+        else
+          @mem.delete(entry.key, entry.seq)
+        end
+      end
+      @writes += 1
+      wal
+    end
+
+    # Extracts keys from one JSON field without failing a write.
+    private def json_index_keys(value : String, field : String) : Array(String)
+      doc = JSON.parse(value)
+      Index.json_field_keys(doc, field)
+    rescue JSON::ParseException
+      [] of String
+    end
+
     private def validate_index_name(name : String) : Nil
       raise InvalidIndexError.new("index name must not be empty") if name.empty?
       raise InvalidIndexError.new("index name contains a NUL byte") if name.includes?(Index::SEP)
@@ -932,10 +1017,21 @@ module Cinderstore
       @manifest = manifest
       @seq = manifest.seq
       @next_id = manifest.next_id
+      load_indexers(manifest)
       load_tables(manifest)
       clean_orphans
       recover_wals
       create_active_wal
+    end
+
+    # Restores JSON indexers recorded in the manifest.
+    private def load_indexers(manifest : Manifest) : Nil
+      manifest.indexes.each do |definition|
+        validate_index_name(definition.name)
+        raise CorruptDataError.new("persisted index field must not be empty") if definition.field.empty?
+        raise CorruptDataError.new("duplicate persisted index: #{definition.name}") if @indexers.has_key?(definition.name)
+        @indexers[definition.name] = ->(_key : String, value : String) { json_index_keys(value, definition.field) }
+      end
     end
 
     private def load_tables(manifest : Manifest) : Nil

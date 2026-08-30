@@ -13,6 +13,40 @@ describe Cinderstore::DB do
     end
   end
 
+  it "backfills existing rows when an index is created" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("idx-backfill", config) do |db, _path|
+      db.put("a", "red")
+      db.put("b", "blue")
+      db.flush
+
+      db.create_index("by-value") { |_key, value| [value] }
+      db.query("by-value", "red").should eq(%w[a])
+      db.query("by-value", "blue").should eq(%w[b])
+
+      db.put("a", "blue")
+      db.delete("b")
+      db.query("by-value", "red").should eq([] of String)
+      db.query("by-value", "blue").should eq(%w[a])
+    end
+  end
+
+  it "restores JSON index maintenance after a restart" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db_path("idx-json-restart") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("old", %({"kind":"tool"}))
+      db.create_json_index("by-kind", "kind")
+      db.close
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.indexes.should eq(%w[by-kind])
+      reopened.query("by-kind", "tool").should eq(%w[old])
+      reopened.put("new", %({"kind":"tool"}))
+      reopened.query("by-kind", "tool").should eq(%w[new old])
+      reopened.close
+    end
+  end
   it "returns primary keys in primary key order for one index key" do
     config = Cinderstore::SpecHelpers.fast_config
     Cinderstore::SpecHelpers.with_db("idx-order", config) do |db, _path|

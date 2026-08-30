@@ -44,6 +44,10 @@ describe Cinderstore::DB do
         begin
           exported.scan.map(&.[0]).should eq(%w[a b])
           exported.stats.entries.should eq(2)
+          exported.indexes.should eq(%w[by-kind])
+          exported.query("by-kind", "tool").should eq(%w[a])
+          exported.put("c", %({"kind":"tool"}))
+          exported.query("by-kind", "tool").should eq(%w[a c])
         ensure
           exported.close
         end
