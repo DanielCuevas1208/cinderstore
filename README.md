@@ -17,8 +17,8 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.14.0. It adds index backfill and durable JSON index definitions.
-JSON index definitions also travel with snapshot exports.
+This is release 0.15.0. It adds bounds to streaming scans and index queries.
+Zero-limit reads now return no rows consistently.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
 whose keys start with the prefix bytes.
@@ -60,6 +60,7 @@ atomic with the data. Compaction drops stale index entries.
 - JSON field indexes with durable definitions
 - Exact and range queries over an index
 - Streaming iterators for exact and range index queries
+- Bounded streaming scans and index queries
 - Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
 - Read-only storage verification for tables and write ahead logs
@@ -108,7 +109,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates indexes after loading data and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.14.0 demo ==
+== Cinderstore 0.15.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -209,6 +210,10 @@ Database directory: ...\cinderstore-demo
    exported rows: 22
    reopened export rows: 22
 
+18. Bounded streaming reads
+   primary scan limit 3 => 3 rows
+   index query limit 2  => 2 rows
+
 Demo complete.
 ```
 
@@ -250,6 +255,9 @@ and log. It reports corruption and metadata mismatches without repair.
 
 Step 17 shows snapshot export. The export copies live primary rows and JSON index
 definitions into a new database. The reopened copy keeps the same row count.
+
+Step 18 shows bounded streams. A primary scan returns three rows, and an index
+range returns two rows. Each iterator enforces its limit.
 
 ## Wire demo
 
@@ -500,6 +508,23 @@ end
 
 Streaming avoids building a result array. A large query keeps a small
 memory footprint. You can stop reading at any time.
+
+### Bound a stream
+
+Pass a non-negative `limit` to bound a streaming scan or index query.
+
+```crystal
+scan = db.scan_iter("SKU-0100", nil, 100)
+scan.each { |key, value| process(key, value) }
+scan.close
+
+matches = db.query_range_iter("by-stock", "20", "40", 25)
+matches.each { |key| process(key) }
+matches.close
+```
+
+The bound applies to database and snapshot iterators. Zero returns no rows.
+Negative values mean no limit. The CLI passes `--limit` to the same path.
 
 Flush and compact explicitly.
 
@@ -869,14 +894,15 @@ examples/demo.cr         Library walkthrough
 examples/server_demo.cr  Wire protocol walkthrough
 fixtures/catalog.csv     Sample product catalog
 spec/export_spec.cr      Export and flush regression tests
+spec/limits_spec.cr      Bounded iterator regression tests
 spec/                    Test suite
 ```
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 205 examples. It covers the
+The suite runs with `crystal spec`. It contains 208 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
-It covers streaming queries, range scans, prefix scans, exports, and verification.
+It covers streaming queries, bounded scans, prefix scans, exports, and verification.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -884,8 +910,9 @@ formatting, runs the suite, runs both demos, and builds the binary.
 Local validation for this release:
 
 - Formatting passed with `crystal tool format --check`.
-- No-codegen type checks passed for the CLI, demos, and all 22 spec files.
-- Full specs and production builds are blocked by restricted Windows process pipes in the MSVC toolchain.
+- No-codegen type checks passed for the CLI, demos, and all 23 spec files.
+- Full executable specs and production builds remain blocked by Windows sandbox restrictions.
+- Crystal cannot create compiler cache files or MSVC process pipes here.
 
 ## Limitations
 
@@ -907,7 +934,8 @@ Local validation for this release:
   large merge. The level targets keep that merge rare.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
-- `scan_iter` has no built-in limit. Stop reading when you reach your limit.
+- A non-negative iterator limit bounds returned rows without materializing the rest.
+- Negative limits mean no limit. Zero limits return no rows.
 - A database-level scan, prefix, or query iterator holds a snapshot until you close it.
 - A wire scan holds a snapshot until it sends `END` or reaches its limit.
 - Wire scan limits must be `-1` or greater.
@@ -921,6 +949,7 @@ Local validation for this release:
 
 Complete:
 
+- Release 0.15: bounded limits apply to primary scans and index queries, including snapshots and CLI reads.
 - Release 0.14: index creation backfills existing rows. JSON definitions survive restart and export.
 - Release 0.13: consistent snapshot export to a new database directory.
 - Release 0.12: streaming primary-key range and prefix scans over the local

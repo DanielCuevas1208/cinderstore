@@ -8,21 +8,33 @@ module Cinderstore
   # A database-level iterator owns the snapshot it reads. Close it when you
   # are done; that releases the snapshot. A snapshot-level iterator shares
   # the snapshot you created, so closing it never releases that snapshot.
+  #
+  # A non-negative `limit` bounds the stream. Zero returns no rows. A negative
+  # limit means no limit.
   class IndexIter
     @own_snapshot : Bool
+    @returned : Int32 = 0
 
     def initialize(@snapshot : Snapshot, @inner : SnapshotIter, @prefix : String,
-                   @finish_key : String?, @own_snapshot : Bool = false)
+                   @finish_key : String?, @own_snapshot : Bool = false, @limit : Int32 = -1)
     end
 
     # Returns the next primary key, or nil at the end of the query.
     def next? : String?
+      if @limit >= 0 && @returned >= @limit
+        raise SnapshotReleasedError.new("snapshot is released") if @snapshot.released?
+        return nil
+      end
+
       finish = @finish_key
       while entry = @inner.next?
         break unless entry.key.starts_with?(@prefix)
         index_key = Index.index_key_of(entry.key)
         break if finish && index_key >= finish
-        return Index.primary_key_of(entry.key) if entry.alive
+        if entry.alive
+          @returned += 1
+          return Index.primary_key_of(entry.key)
+        end
       end
       nil
     end

@@ -290,6 +290,13 @@ module Cinderstore
       export_db = DB.new(export_path, export_config)
       puts "   exported rows: #{exported}"
       puts "   reopened export rows: #{export_db.scan.size}"
+      puts "18. Bounded streaming reads"
+      limited_scan = export_db.scan_iter("", nil, 3)
+      puts "   primary scan limit 3 => #{limited_scan.to_a.size} rows"
+      limited_scan.close
+      limited_query = export_db.query_range_iter("by-stock", "20", "40", 2)
+      puts "   index query limit 2  => #{limited_query.to_a.size} rows"
+      limited_query.close
       export_db.close
       puts ""
 

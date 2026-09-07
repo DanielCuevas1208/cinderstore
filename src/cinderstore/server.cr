@@ -157,18 +157,14 @@ module Cinderstore
     # change the result. A limit stops the iterator before the next row.
     private def stream_scan(client : TCPSocket, command : Command) : Nil
       iter = if command.op == "SCANPREFIX"
-               @db.scan_prefix_iter(command.start)
+               @db.scan_prefix_iter(command.start, command.limit)
              else
-               @db.scan_iter(command.start, command.finish)
+               @db.scan_iter(command.start, command.finish, command.limit)
              end
-      count = 0
       begin
-        while command.limit < 0 || count < command.limit
-          pair = iter.next?
-          break unless pair
+        while pair = iter.next?
           client << "ROW #{pair[0]} #{pair[1]}\n"
           client.flush
-          count += 1
         end
         client << "END\n"
         client.flush

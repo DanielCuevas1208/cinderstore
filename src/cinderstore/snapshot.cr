@@ -46,12 +46,11 @@ module Cinderstore
     # Returns live key/value pairs whose keys start with `prefix`.
     # A negative limit means no limit.
     def scan_prefix(prefix : String, limit : Int32 = -1) : Array(Tuple(String, String))
-      iter = scan_prefix_iter(prefix)
+      iter = scan_prefix_iter(prefix, limit)
       result = [] of Tuple(String, String)
       begin
         while pair = iter.next?
           result << pair
-          break if limit >= 0 && result.size >= limit
         end
         result
       ensure
@@ -64,6 +63,7 @@ module Cinderstore
     def scan(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : Array(Tuple(String, String))
       @lock.synchronize do
         check_released
+        return [] of Tuple(String, String) if limit == 0
         result = [] of Tuple(String, String)
         iter = LiveIter.new(make_merge_iter(start_key, false))
         while entry = iter.next?
@@ -79,12 +79,12 @@ module Cinderstore
 
     # Returns a streaming iterator over live pairs whose keys start with
     # `prefix`. The iterator borrows this snapshot.
-    def scan_prefix_iter(prefix : String) : ScanIter
+    def scan_prefix_iter(prefix : String, limit : Int32 = -1) : ScanIter
       @lock.synchronize do
         check_released
         finish = Util.prefix_end(prefix)
         inner = SnapshotIter.new(self, LiveIter.new(make_merge_iter(prefix, false)))
-        ScanIter.new(self, inner, finish, prefix)
+        ScanIter.new(self, inner, finish, prefix, false, limit)
       end
     end
 
@@ -92,10 +92,10 @@ module Cinderstore
     #
     # The iterator shares this snapshot and reads the range [start, finish).
     # Closing it never releases the snapshot. Release the snapshot when done.
-    def scan_iter(start_key : String = "", finish_key : String? = nil) : ScanIter
+    def scan_iter(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : ScanIter
       @lock.synchronize do
         check_released
-        ScanIter.new(self, SnapshotIter.new(self, LiveIter.new(make_merge_iter(start_key, false))), finish_key)
+        ScanIter.new(self, SnapshotIter.new(self, LiveIter.new(make_merge_iter(start_key, false))), finish_key, nil, false, limit)
       end
     end
 
@@ -112,6 +112,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_released
+        return [] of String if limit == 0
         prefix = Index.exact_prefix(index, index_key)
         keys = [] of String
         iter = make_merge_iter(prefix, false)
@@ -135,6 +136,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_released
+        return [] of String if limit == 0
         prefix = Index.name_prefix(index)
         start = "#{prefix}#{start_key}#{Index::SEP}"
         keys = [] of String
@@ -170,12 +172,12 @@ module Cinderstore
     # the snapshot, so it stays consistent while the database keeps writing.
     # Keys come back in primary key order. Close the iterator before you
     # release the snapshot. Closing the iterator never releases the snapshot.
-    def query_iter(index : String, index_key : String) : IndexIter
+    def query_iter(index : String, index_key : String, limit : Int32 = -1) : IndexIter
       validate_index_name(index)
       @lock.synchronize do
         check_released
         prefix = Index.exact_prefix(index, index_key)
-        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(prefix, false)), prefix, nil)
+        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(prefix, false)), prefix, nil, false, limit)
       end
     end
 
@@ -187,13 +189,14 @@ module Cinderstore
     # so it stays consistent while the database keeps writing. Close the
     # iterator before you release the snapshot. Closing the iterator never
     # releases the snapshot.
-    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil) : IndexIter
+    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil,
+                         limit : Int32 = -1) : IndexIter
       validate_index_name(index)
       @lock.synchronize do
         check_released
         prefix = Index.name_prefix(index)
         start = "#{prefix}#{start_key}#{Index::SEP}"
-        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(start, false)), prefix, finish_key)
+        IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(start, false)), prefix, finish_key, false, limit)
       end
     end
 

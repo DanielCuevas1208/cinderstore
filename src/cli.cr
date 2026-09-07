@@ -175,17 +175,14 @@ module Cinderstore
       iter : ScanIter? = nil
       begin
         iter = if prefix
-                 db.scan_prefix_iter(prefix.not_nil!)
+                 db.scan_prefix_iter(prefix.not_nil!, limit)
                else
-                 db.scan_iter(start_key, finish_key.empty? ? nil : finish_key)
+                 db.scan_iter(start_key, finish_key.empty? ? nil : finish_key, limit)
                end
         stream = iter.not_nil!
 
-        count = 0
         while pair = stream.next?
           puts "#{pair[0]}\t#{pair[1]}"
-          count += 1
-          break if limit >= 0 && count >= limit
         end
       ensure
         iter.try { |value| value.close }
@@ -219,15 +216,12 @@ module Cinderstore
       db = DB.new(db_path)
       begin
         iter = if key.empty?
-                 db.query_range_iter(index, start_key, finish_key.empty? ? nil : finish_key)
+                 db.query_range_iter(index, start_key, finish_key.empty? ? nil : finish_key, limit)
                else
-                 db.query_iter(index, key)
+                 db.query_iter(index, key, limit)
                end
-        count = 0
         while pk = iter.next?
           puts pk
-          count += 1
-          break if limit >= 0 && count >= limit
         end
         iter.close
       ensure

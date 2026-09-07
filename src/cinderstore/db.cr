@@ -282,6 +282,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_open
+        return [] of String if limit == 0
         prefix = Index.exact_prefix(index, index_key)
         keys = [] of String
         iter = make_merge_iter(prefix, false)
@@ -305,6 +306,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_open
+        return [] of String if limit == 0
         prefix = Index.name_prefix(index)
         start = "#{prefix}#{start_key}#{Index::SEP}"
         keys = [] of String
@@ -329,11 +331,11 @@ module Cinderstore
     # consistent while the store keeps writing. Keys come back in primary
     # key order. The iterator owns its snapshot, so call `close` when you
     # are done; that releases the snapshot.
-    def query_iter(index : String, index_key : String) : IndexIter
+    def query_iter(index : String, index_key : String, limit : Int32 = -1) : IndexIter
       validate_index_name(index)
       snap = snapshot
       begin
-        iter = snap.query_iter(index, index_key)
+        iter = snap.query_iter(index, index_key, limit)
         iter.take_ownership
         iter
       rescue ex
@@ -350,11 +352,12 @@ module Cinderstore
     # taken at creation, so it stays consistent while the store keeps
     # writing. The iterator owns its snapshot, so call `close` when you are
     # done; that releases the snapshot.
-    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil) : IndexIter
+    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil,
+                         limit : Int32 = -1) : IndexIter
       validate_index_name(index)
       snap = snapshot
       begin
-        iter = snap.query_range_iter(index, start_key, finish_key)
+        iter = snap.query_range_iter(index, start_key, finish_key, limit)
         iter.take_ownership
         iter
       rescue ex
@@ -501,12 +504,11 @@ module Cinderstore
     # Returns live key/value pairs whose keys start with `prefix`.
     # A negative limit means no limit.
     def scan_prefix(prefix : String, limit : Int32 = -1) : Array(Tuple(String, String))
-      iter = scan_prefix_iter(prefix)
+      iter = scan_prefix_iter(prefix, limit)
       result = [] of Tuple(String, String)
       begin
         while pair = iter.next?
           result << pair
-          break if limit >= 0 && result.size >= limit
         end
         result
       ensure
@@ -519,16 +521,17 @@ module Cinderstore
     def scan(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : Array(Tuple(String, String))
       @lock.synchronize do
         check_open
+        return [] of Tuple(String, String) if limit == 0
         collect_range(start_key, finish_key, limit)
       end
     end
 
     # Returns a streaming iterator over live pairs whose keys start with
     # `prefix`. The iterator owns the snapshot it creates.
-    def scan_prefix_iter(prefix : String) : ScanIter
+    def scan_prefix_iter(prefix : String, limit : Int32 = -1) : ScanIter
       snap = snapshot
       begin
-        iter = snap.scan_prefix_iter(prefix)
+        iter = snap.scan_prefix_iter(prefix, limit)
         iter.take_ownership
         iter
       rescue ex
@@ -543,10 +546,10 @@ module Cinderstore
     # consistent while the store keeps writing. The range is [start, finish).
     # The iterator owns its snapshot. Call `close` when you are done.
     #
-    def scan_iter(start_key : String = "", finish_key : String? = nil) : ScanIter
+    def scan_iter(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : ScanIter
       snap = snapshot
       begin
-        iter = snap.scan_iter(start_key, finish_key)
+        iter = snap.scan_iter(start_key, finish_key, limit)
         iter.take_ownership
         iter
       rescue ex
