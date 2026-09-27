@@ -27,6 +27,14 @@ private def send_command(sock : TCPSocket, command : String) : String?
   sock.gets
 end
 
+private def receive_rows(sock : TCPSocket) : Array(String)
+  rows = [] of String
+  while (line = sock.gets) && line != "END"
+    rows << line
+  end
+  rows
+end
+
 describe Cinderstore::Server do
   it "serves put, get, and delete over a socket" do
     config = Cinderstore::SpecHelpers.fast_config
@@ -107,6 +115,38 @@ describe Cinderstore::Server do
           rows << line
         end
         rows.should eq(["ROW a"])
+        sock.close
+      end
+    end
+  end
+
+  it "bounds exact and range index queries over a socket" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("server-query-limits", config) do |db, _path|
+      db.create_index("by-value") { |_key, value| [value] }
+      4.times { |index| db.put("key-#{index}", "same") }
+      db.put("key-spaced", "red ember")
+      with_server(db) do |server|
+        sock = TCPSocket.new("127.0.0.1", server.port)
+
+        sock << "QUERY by-value same 2\n"
+        sock.flush
+        receive_rows(sock).should eq(["ROW key-0", "ROW key-1"])
+
+        sock << "QUERYRANGE by-value same samez 2\n"
+        sock.flush
+        receive_rows(sock).should eq(["ROW key-0", "ROW key-1"])
+
+        sock << "QUERY by-value same 0\n"
+        sock.flush
+        receive_rows(sock).should eq([] of String)
+
+        sock << "QUERY by-value red ember 1\n"
+        sock.flush
+        receive_rows(sock).should eq(["ROW key-spaced"])
+
+        error = send_command(sock, "QUERYRANGE by-value same samez nope")
+        error.not_nil!.should start_with("ERR limit must be an integer")
         sock.close
       end
     end

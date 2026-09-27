@@ -17,8 +17,8 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.15.0. It adds bounds to streaming scans and index queries.
-Zero-limit reads now return no rows consistently.
+This is release 0.16.0. It adds bounds to TCP index queries.
+All streaming read paths now accept the same limit rules.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
 whose keys start with the prefix bytes.
@@ -61,6 +61,7 @@ atomic with the data. Compaction drops stale index entries.
 - Exact and range queries over an index
 - Streaming iterators for exact and range index queries
 - Bounded streaming scans and index queries
+- Bounded index queries over the local protocol
 - Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
 - Read-only storage verification for tables and write ahead logs
@@ -109,7 +110,7 @@ scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates indexes after loading data and queries them. The output is deterministic.
 
 ```text
-== Cinderstore 0.15.0 demo ==
+== Cinderstore 0.16.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -261,7 +262,7 @@ range returns two rows. Each iterator enforces its limit.
 
 ## Wire demo
 
-The wire demo starts a local server, writes two values, reads them, deletes one, and streams a prefix scan.
+The wire demo starts a local server, writes two values, reads them, deletes one, and streams bounded reads.
 
 ```text
 PUT forge-hammer => OK
@@ -271,6 +272,8 @@ GET missing      => NOT_FOUND
 DEL forge-tongs  => OK
 SCANPREFIX       => ROW forge-hammer steel 1.5kg
 SCANPREFIX       => END
+QUERY            => ROW forge-hammer
+QUERY            => END
 SHUTDOWN         => BYE
 ```
 
@@ -655,8 +658,8 @@ newlines. Values must not contain newlines.
 | `GET key` | Read a value |
 | `DEL key` | Delete a key |
 | `SCAN start finish limit` | List a range |
-| `QUERY index index_key` | Query one index key |
-| `QUERYRANGE index start finish` | Query an index range |
+| `QUERY index index_key [limit]` | Query one index key |
+| `QUERYRANGE index start finish [limit]` | Query an index range |
 | `STATS` | Show counters |
 | `PING` | Check the server |
 | `FLUSH` | Flush the memtable |
@@ -678,7 +681,8 @@ A `SCAN` command streams live key/value pairs in `[start, finish)`. A
 A missing limit returns all rows. A zero limit returns no rows.
 
 `QUERY` and `QUERYRANGE` stream primary keys. The server writes each row
-as the iterator produces it, then writes `END`.
+as the iterator produces it, then writes `END`. Their limits use the same
+rules as scan limits.
 
 Use a tool such as `nc` or the included example client.
 
@@ -900,9 +904,9 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 208 examples. It covers the
+The suite runs with `crystal spec`. It contains 209 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
-It covers streaming queries, bounded scans, prefix scans, exports, and verification.
+It covers bounded scans, bounded index queries, prefix scans, exports, and verification.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -939,6 +943,7 @@ Local validation for this release:
 - A database-level scan, prefix, or query iterator holds a snapshot until you close it.
 - A wire scan holds a snapshot until it sends `END` or reaches its limit.
 - Wire scan limits must be `-1` or greater.
+- Wire index query limits must be `-1` or greater.
 - An export destination must not exist.
 - Exports copy primary rows and persisted JSON index definitions.
 - Custom index blocks are not copied during export.
@@ -949,6 +954,7 @@ Local validation for this release:
 
 Complete:
 
+- Release 0.16: bounded exact and range index queries work over the local protocol.
 - Release 0.15: bounded limits apply to primary scans and index queries, including snapshots and CLI reads.
 - Release 0.14: index creation backfills existing rows. JSON definitions survive restart and export.
 - Release 0.13: consistent snapshot export to a new database directory.

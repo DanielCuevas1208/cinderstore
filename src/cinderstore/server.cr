@@ -108,11 +108,14 @@ module Cinderstore
       when "QUERY"
         raise ProtocolError.new("missing index") if parts.size < 2
         raise ProtocolError.new("missing index key") if parts.size < 3
-        Command.new(op, parts[1], parts[2], "", nil, -1)
+        index_key, limit = parse_query_key_and_limit(parts[2])
+        Command.new(op, parts[1], index_key, "", nil, limit)
       when "QUERYRANGE"
         tokens = line.split(" ")
         raise ProtocolError.new("missing index") if tokens.size < 2
-        Command.new(op, tokens[1], nil, tokens[2]? || "", tokens[3]?, -1)
+        raise ProtocolError.new("too many arguments") if tokens.size > 5
+        limit = parse_limit(tokens[4]?)
+        Command.new(op, tokens[1], nil, tokens[2]? || "", tokens[3]?, limit)
       when "STATS", "PING", "FLUSH", "COMPACT", "SHUTDOWN"
         Command.new(op, "", nil, "", nil, -1)
       else
@@ -179,9 +182,9 @@ module Cinderstore
     # iterator produces it, so a large result keeps a small memory footprint.
     private def stream_index_query(client : TCPSocket, command : Command) : Nil
       iter = if command.op == "QUERY"
-               @db.query_iter(command.key, command.value.not_nil!)
+               @db.query_iter(command.key, command.value.not_nil!, command.limit)
              else
-               @db.query_range_iter(command.key, command.start, command.finish)
+               @db.query_range_iter(command.key, command.start, command.finish, command.limit)
              end
       begin
         while key = iter.next?
@@ -200,6 +203,20 @@ module Cinderstore
       raise ProtocolError.new("limit must be an integer") unless limit
       raise ProtocolError.new("limit must not be less than -1") if limit < -1
       limit
+    end
+
+    # Parses an optional trailing limit without breaking index keys that contain spaces.
+    private def parse_query_key_and_limit(value : String) : Tuple(String, Int32)
+      tokens = value.split(" ")
+      return {value, -1} if tokens.size < 2
+
+      candidate = tokens.last
+      limit = candidate.to_i?
+      return {value, -1} unless limit
+
+      key = tokens[0, tokens.size - 1].join(" ")
+      raise ProtocolError.new("missing index key") if key.empty?
+      {key, parse_limit(candidate)}
     end
   end
 end
