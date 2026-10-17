@@ -26,4 +26,8 @@ module Cinderstore
   # Raised when an operation targets a released snapshot.
   class SnapshotReleasedError < Error
   end
+
+  # Raised when a secondary index definition or index key is invalid.
+  class InvalidIndexError < Error
+  end
 end

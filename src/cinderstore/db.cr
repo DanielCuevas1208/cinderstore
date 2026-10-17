@@ -15,6 +15,7 @@ module Cinderstore
     MAX_TABLE_ENTRIES = 20_000
     MAX_KEY_BYTES     =   4096
     MAX_VALUE_BYTES   = 4 * 1024 * 1024
+    EXPORT_BATCH_SIZE = 256
 
     # Tuning options for a database instance.
     class Config
@@ -28,6 +29,9 @@ module Cinderstore
       property cache_blocks : Int32 = 512
       # Fsync after every write when true.
       property sync_writes : Bool = true
+      # Write CRC32 checksums on new data when true. Set to false for
+      # higher throughput. Reads still verify files that carry checksums.
+      property checksums : Bool = true
       # Number of level-0 tables that trigger compaction.
       property l0_compact_threshold : Int32 = 4
       # Start background compaction after a flush when true.
@@ -52,10 +56,13 @@ module Cinderstore
       getter seq : Int64
       getter cache_hits : Int64
       getter cache_misses : Int64
+      getter writes : Int64
+      getter commits : Int64
 
       def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @level_counts : Array(Int32),
                      @entries : Int64, @disk_bytes : Int64, @memtable_bytes : Int64,
-                     @wal_bytes : Int64, @seq : Int64, @cache_hits : Int64, @cache_misses : Int64)
+                     @wal_bytes : Int64, @seq : Int64, @cache_hits : Int64, @cache_misses : Int64,
+                     @writes : Int64, @commits : Int64)
       end
 
       def to_h : Hash(String, Int32 | Int64 | Array(Int32))
@@ -71,6 +78,8 @@ module Cinderstore
           "seq"            => @seq,
           "cache_hits"     => @cache_hits,
           "cache_misses"   => @cache_misses,
+          "writes"         => @writes,
+          "commits"        => @commits,
         }
       end
 
@@ -86,7 +95,50 @@ module Cinderstore
         io << "memtable bytes: #{@memtable_bytes}\n"
         io << "wal bytes: #{@wal_bytes}\n"
         io << "sequence: #{@seq}\n"
-        io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}"
+        io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}\n"
+        io << "writes: #{@writes}, commits: #{@commits}"
+      end
+    end
+
+    # Results from a read-only storage verification.
+    class VerificationReport
+      getter tables : Int32
+      getter table_entries : Int64
+      getter wal_files : Int32
+      getter wal_records : Int64
+      getter bytes_checked : Int64
+      getter errors : Array(String)
+
+      def initialize(@tables : Int32, @table_entries : Int64, @wal_files : Int32,
+                     @wal_records : Int64, @bytes_checked : Int64, @errors : Array(String))
+      end
+
+      def valid? : Bool
+        @errors.empty?
+      end
+
+      def to_h : Hash(String, Bool | Int32 | Int64 | Array(String))
+        {
+          "valid"         => valid?,
+          "tables"        => @tables,
+          "table_entries" => @table_entries,
+          "wal_files"     => @wal_files,
+          "wal_records"   => @wal_records,
+          "bytes_checked" => @bytes_checked,
+          "errors"        => @errors,
+        }
+      end
+
+      def to_json(io : IO) : Nil
+        to_h.to_json(io)
+      end
+
+      def to_s(io : IO) : Nil
+        io << "verification: #{valid? ? "valid" : "invalid"}\n"
+        io << "tables: #{@tables}, table entries: #{@table_entries}\n"
+        io << "wal files: #{@wal_files}, wal records: #{@wal_records}\n"
+        io << "bytes checked: #{@bytes_checked}"
+        @errors.each { |error| io << "\nerror: #{error}" }
       end
     end
 
@@ -96,13 +148,15 @@ module Cinderstore
       getter first : String
       getter last : String
       getter count : Int64
+      getter index_count : Int64
       getter path : String
 
       @reader : SstableReader?
       @refs : Int32 = 1
       @orphaned : Bool = false
 
-      def initialize(@id : Int64, @first : String, @last : String, @count : Int64, @path : String)
+      def initialize(@id : Int64, @first : String, @last : String, @count : Int64, @path : String,
+                     @index_count : Int64 = 0_i64)
       end
 
       # Returns the cached reader for this table.
@@ -168,6 +222,9 @@ module Cinderstore
     @compacting = false
     @pending_table_id : Int64 = 0_i64
     @manifest : Manifest? = nil
+    @writes : Int64 = 0_i64
+    @commit_group : CommitGroup? = nil
+    @indexers : Hash(String, Proc(String, String, Array(String)))
 
     def initialize(path : String, config : Config = Config.new)
       @path = path
@@ -175,35 +232,245 @@ module Cinderstore
       @mem = MemTable.new
       @levels = [[] of TableRef]
       @block_cache = BlockCache.new(config.cache_blocks)
+      @indexers = {} of String => Proc(String, String, Array(String))
       open
+      @commit_group = CommitGroup.new if config.sync_writes
     end
 
     def path : String
       @path
     end
 
+    # Registers a secondary index with a custom extractor.
+    #
+    # The block receives the primary key and its value. It returns the
+    # index keys that identify the value. The store maintains the index
+    # on every write. Creation also backfills existing rows.
+    # Call `query` to find the primary keys that share an index key.
+    def create_index(name : String, &indexer : String, String -> Array(String)) : Nil
+      register_index(name, indexer)
+    end
+
+    # Registers an index that reads one JSON field from every value.
+    #
+    # A scalar field yields one index key. An array field yields one key
+    # per element. A value that is not JSON, or that lacks the field,
+    # yields no index keys. Creation backfills existing rows.
+    # The indexer never fails a write.
+    def create_json_index(name : String, field : String) : Nil
+      raise InvalidIndexError.new("field must not be empty") if field.empty?
+      indexer = ->(_key : String, value : String) { json_index_keys(value, field) }
+      register_index(name, indexer, Manifest::IndexInfo.new(name, field))
+    end
+
+    # Returns true when `name` is a registered index.
+    def index?(name : String) : Bool
+      @lock.synchronize { @indexers.has_key?(name) }
+    end
+
+    # Returns the names of all registered indexes, in creation order.
+    def indexes : Array(String)
+      @lock.synchronize { @indexers.keys }
+    end
+
+    # Returns the primary keys whose value maps to `index_key` in `index`.
+    #
+    # The keys come back in primary key order. A negative `limit` means no
+    # limit. The query reads the materialized index entries, so it works
+    # whether or not the index is registered in this process.
+    def query(index : String, index_key : String, limit : Int32 = -1) : Array(String)
+      validate_index_name(index)
+      @lock.synchronize do
+        check_open
+        return [] of String if limit == 0
+        prefix = Index.exact_prefix(index, index_key)
+        keys = [] of String
+        iter = make_merge_iter(prefix, false)
+        while entry = iter.next?
+          break unless entry.key.starts_with?(prefix)
+          if entry.alive
+            keys << Index.primary_key_of(entry.key)
+            break if limit >= 0 && keys.size >= limit
+          end
+        end
+        keys
+      end
+    end
+
+    # Returns the primary keys whose index key lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. A negative `limit` means no limit.
+    def query_range(index : String, start_key : String = "", finish_key : String? = nil,
+                    limit : Int32 = -1) : Array(String)
+      validate_index_name(index)
+      @lock.synchronize do
+        check_open
+        return [] of String if limit == 0
+        prefix = Index.name_prefix(index)
+        start = "#{prefix}#{start_key}#{Index::SEP}"
+        keys = [] of String
+        iter = make_merge_iter(start, false)
+        while entry = iter.next?
+          break unless entry.key.starts_with?(prefix)
+          index_key = Index.index_key_of(entry.key)
+          break if finish_key && index_key >= finish_key
+          if entry.alive
+            keys << Index.primary_key_of(entry.key)
+            break if limit >= 0 && keys.size >= limit
+          end
+        end
+        keys
+      end
+    end
+
+    # Returns a streaming iterator over the primary keys that map to
+    # `index_key` in `index`.
+    #
+    # The iterator reads a snapshot taken at creation, so it stays
+    # consistent while the store keeps writing. Keys come back in primary
+    # key order. The iterator owns its snapshot, so call `close` when you
+    # are done; that releases the snapshot.
+    def query_iter(index : String, index_key : String, limit : Int32 = -1) : IndexIter
+      validate_index_name(index)
+      snap = snapshot
+      begin
+        iter = snap.query_iter(index, index_key, limit)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
+      end
+    end
+
+    # Returns a streaming iterator over the primary keys whose index key
+    # lies in [start, finish).
+    #
+    # The keys come back in index key order, then primary key order. A nil
+    # `finish_key` means no upper bound. The iterator reads a snapshot
+    # taken at creation, so it stays consistent while the store keeps
+    # writing. The iterator owns its snapshot, so call `close` when you are
+    # done; that releases the snapshot.
+    def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil,
+                         limit : Int32 = -1) : IndexIter
+      validate_index_name(index)
+      snap = snapshot
+      begin
+        iter = snap.query_range_iter(index, start_key, finish_key, limit)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
+      end
+    end
+
     # Writes a value for `key`.
     def put(key : String, value : String) : Nil
       validate_key(key)
       raise InvalidValueError.new("value exceeds #{MAX_VALUE_BYTES} bytes") if value.bytesize > MAX_VALUE_BYTES
+      wal : Wal::Writer? = nil
       @lock.synchronize do
         check_open
         @seq += 1
-        @wal.not_nil!.append(Entry.new(key, @seq, true, value))
-        @mem.put(key, value, @seq)
+        seq = @seq
+        entries = maintenance_entries_for(seq, key, value)
+        main = Entry.new(key, seq, true, value)
+        wal = @wal.not_nil!
+        if entries.empty?
+          wal.append(main)
+        else
+          wal.append_batch([main] + entries)
+        end
+        @mem.put(key, value, seq)
+        apply_index_entries(entries)
+        @writes += 1
       end
+      commit_wal(wal.not_nil!)
       trigger_flush
     end
 
     # Writes a tombstone for `key`.
     def delete(key : String) : Nil
       validate_key(key)
+      wal : Wal::Writer? = nil
       @lock.synchronize do
         check_open
         @seq += 1
-        @wal.not_nil!.append(Entry.new(key, @seq, false, ""))
-        @mem.delete(key, @seq)
+        seq = @seq
+        entries = maintenance_entries_for(seq, key, nil)
+        main = Entry.new(key, seq, false, "")
+        wal = @wal.not_nil!
+        if entries.empty?
+          wal.append(main)
+        else
+          wal.append_batch([main] + entries)
+        end
+        @mem.delete(key, seq)
+        apply_index_entries(entries)
+        @writes += 1
       end
+      commit_wal(wal.not_nil!)
+      trigger_flush
+    end
+
+    # Applies `batch` atomically.
+    #
+    # Every queued operation becomes one record in the write ahead log. A
+    # crash before the record is durable drops the whole batch, so the
+    # store never applies part of it. The sequence numbers of a batch are
+    # consecutive and assigned in queue order.
+    def write(batch : Batch) : Nil
+      return if batch.empty?
+      wal : Wal::Writer? = nil
+      @lock.synchronize do
+        check_open
+        ops = [] of Tuple(String, String, Bool)
+        batch.each do |key, value, alive|
+          validate_key(key)
+          raise InvalidValueError.new("value exceeds #{MAX_VALUE_BYTES} bytes") if value.bytesize > MAX_VALUE_BYTES
+          ops << {key, value, alive}
+        end
+        return if ops.empty?
+        entries = [] of Entry
+        # The index keys a batch op sees start from the previous value the
+        # batch wrote for the key, or from the store when the batch is the
+        # first to touch the key.
+        current_keys = {} of String => Hash(String, Array(String))
+        touched = {} of String => Bool
+        ops.each do |key, value, alive|
+          @seq += 1
+          seq = @seq
+          unless touched[key]?
+            touched[key] = true
+            current_keys[key] = index_keys_for(key, read_live_value(key))
+          end
+          new_keys = alive ? index_keys_for(key, value) : {} of String => Array(String)
+          entries << Entry.new(key, seq, alive, value)
+          entries.concat(index_delta_entries(seq, key, current_keys[key], new_keys))
+          current_keys[key] = new_keys
+        end
+        wal = @wal.not_nil!
+        wal.append_batch(entries)
+        entries.each do |entry|
+          if entry.alive
+            @mem.put(entry.key, entry.value, entry.seq)
+          else
+            @mem.delete(entry.key, entry.seq)
+          end
+        end
+        @writes += 1
+      end
+      commit_wal(wal.not_nil!)
+      trigger_flush
+    end
+
+    # Builds a batch in a block, then writes it atomically.
+    def write(&block : Batch ->) : Nil
+      batch = Batch.new
+      yield batch
+      write(batch)
     end
 
     # Returns the live value for `key`, or nil.
@@ -234,12 +501,60 @@ module Cinderstore
       pairs.each { |key, value| yield key, value }
     end
 
+    # Returns live key/value pairs whose keys start with `prefix`.
+    # A negative limit means no limit.
+    def scan_prefix(prefix : String, limit : Int32 = -1) : Array(Tuple(String, String))
+      iter = scan_prefix_iter(prefix, limit)
+      result = [] of Tuple(String, String)
+      begin
+        while pair = iter.next?
+          result << pair
+        end
+        result
+      ensure
+        iter.close
+      end
+    end
+
     # Returns live key/value pairs in key order. The range is [start, finish).
     # A negative limit means no limit.
     def scan(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : Array(Tuple(String, String))
       @lock.synchronize do
         check_open
+        return [] of Tuple(String, String) if limit == 0
         collect_range(start_key, finish_key, limit)
+      end
+    end
+
+    # Returns a streaming iterator over live pairs whose keys start with
+    # `prefix`. The iterator owns the snapshot it creates.
+    def scan_prefix_iter(prefix : String, limit : Int32 = -1) : ScanIter
+      snap = snapshot
+      begin
+        iter = snap.scan_prefix_iter(prefix, limit)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
+      end
+    end
+
+    # Returns a streaming iterator over live key/value pairs in key order.
+    #
+    # The iterator reads a snapshot taken at creation, so it stays
+    # consistent while the store keeps writing. The range is [start, finish).
+    # The iterator owns its snapshot. Call `close` when you are done.
+    #
+    def scan_iter(start_key : String = "", finish_key : String? = nil, limit : Int32 = -1) : ScanIter
+      snap = snapshot
+      begin
+        iter = snap.scan_iter(start_key, finish_key, limit)
+        iter.take_ownership
+        iter
+      rescue ex
+        snap.release
+        raise ex
       end
     end
 
@@ -304,13 +619,56 @@ module Cinderstore
       end
     end
 
+    # Copies the live primary key/value pairs from one consistent snapshot
+    # into a new database directory. The destination must not exist.
+    #
+    # The export streams the source snapshot and writes bounded batches. It
+    # returns the number of primary rows copied. Persisted JSON index definitions
+    # are copied to the destination. Custom index blocks remain process-local.
+    def export(destination : String, config : Config = Config.new) : Int64
+      raise Error.new("export destination already exists: #{destination}") if File.exists?(destination)
+
+      view = snapshot
+      target : DB? = nil
+      iterator : ScanIter? = nil
+      copied = 0_i64
+      batch = Batch.new
+      begin
+        target = DB.new(destination, config)
+        index_definitions = @lock.synchronize do
+          @manifest.not_nil!.indexes.map { |definition| {definition.name, definition.field} }
+        end
+        index_definitions.each do |name, field|
+          target.not_nil!.create_json_index(name, field)
+        end
+        iterator = view.scan_iter
+        while pair = iterator.not_nil!.next?
+          batch.put(pair[0], pair[1])
+          copied += 1
+          if batch.size >= EXPORT_BATCH_SIZE
+            target.not_nil!.write(batch)
+            batch = Batch.new
+          end
+        end
+        target.not_nil!.write(batch) unless batch.empty?
+        target.not_nil!.flush
+        copied
+      ensure
+        iterator.try(&.close)
+        view.release
+        target.try(&.close)
+      end
+    end
+
     # Returns a snapshot of database counters.
     def stats : Stats
       @lock.synchronize do
         check_open
         table_refs = @levels.flatten
         disk_bytes = table_refs.sum { |ref| file_size(ref.path) }
-        entries = table_refs.sum(&.count) + @mem.size + (@frozen.try(&.size) || 0_i64)
+        entries = table_refs.sum { |ref| ref.count - ref.index_count } +
+                  (@mem.size - @mem.index_count) +
+                  (@frozen.try { |m| m.size - m.index_count } || 0_i64)
         wal_bytes = 0_i64
         Dir.children(@path).each do |name|
           wal_bytes += file_size(File.join(@path, name)) if name.ends_with?(WAL_SUFFIX)
@@ -327,7 +685,137 @@ module Cinderstore
           seq: @seq,
           cache_hits: @block_cache.hits,
           cache_misses: @block_cache.misses,
+          writes: @writes,
+          commits: @commit_group.try(&.commits) || 0_i64,
         )
+      end
+    end
+
+    # Verifies a database directory without opening or recovering it.
+    #
+    # This entry point is safe for diagnostics because it does not remove
+    # orphan files, replay logs, or create a new active log.
+    def self.verify(path : String) : VerificationReport
+      errors = [] of String
+      table_entries = 0_i64
+      bytes_checked = 0_i64
+      table_infos = [] of Manifest::TableInfo
+      children = begin
+        Dir.children(path)
+      rescue ex : Exception
+        errors << "database directory: #{verification_error(ex)}"
+        [] of String
+      end
+
+      manifest_path = File.join(path, MANIFEST_NAME)
+      bytes_checked += verification_file_size(manifest_path)
+      if File.exists?(manifest_path)
+        begin
+          table_infos = Manifest.load(manifest_path).levels.flatten
+        rescue ex : Exception
+          errors << "#{MANIFEST_NAME}: #{verification_error(ex)}"
+        end
+      else
+        errors << "#{MANIFEST_NAME}: file is missing"
+      end
+
+      known_ids = table_infos.map(&.id)
+      table_infos.each do |info|
+        table_path = File.join(path, "#{Util.file_stem(info.id)}#{SST_SUFFIX}")
+        bytes_checked += verification_file_size(table_path)
+        reader : SstableReader? = nil
+        begin
+          reader = SstableReader.new(table_path, info.id)
+          actual = reader.not_nil!.verify
+          table_entries += actual.count
+          unless actual.id == info.id && actual.first == info.first &&
+                 actual.last == info.last && actual.count == info.count &&
+                 actual.index_count == info.index_count
+            errors << "#{File.basename(table_path)}: manifest metadata mismatch"
+          end
+        rescue ex : Exception
+          errors << "#{File.basename(table_path)}: #{verification_error(ex)}"
+        ensure
+          reader.try(&.close)
+        end
+      end
+
+      children.select { |name| name.ends_with?(SST_SUFFIX) }.sort.each do |name|
+        id = name.rpartition(".")[0].to_i64
+        unless known_ids.includes?(id)
+          errors << "#{name}: table is not listed in #{MANIFEST_NAME}"
+        end
+      end
+
+      wal_files = 0
+      wal_records = 0_i64
+      children.select { |name| name.ends_with?(WAL_SUFFIX) }.sort.each do |name|
+        wal_files += 1
+        wal_path = File.join(path, name)
+        bytes_checked += verification_file_size(wal_path)
+        begin
+          wal_records += Wal.verify(wal_path)
+        rescue ex : Exception
+          errors << "#{name}: #{verification_error(ex)}"
+        end
+      end
+
+      VerificationReport.new(table_infos.size.to_i32, table_entries, wal_files,
+        wal_records, bytes_checked, errors)
+    end
+
+    # Checks every manifest table and write ahead log without changing data.
+    #
+    # The check waits for an active flush, then blocks writes for its duration.
+    # It verifies table blocks, bloom filters, WAL framing, and manifest
+    # metadata. Fast-mode files can only be checked for layout, not bit rot.
+    def verify : VerificationReport
+      @flush_lock.synchronize do
+        @lock.synchronize do
+          check_open
+          errors = [] of String
+          table_refs = @levels.flatten
+          table_entries = 0_i64
+          bytes_checked = 0_i64
+          bytes_checked += file_size(File.join(@path, MANIFEST_NAME))
+
+          table_refs.each do |ref|
+            bytes_checked += file_size(ref.path)
+            reader : SstableReader? = nil
+            begin
+              # Use a fresh reader so verification bypasses caches and does
+              # not move the file position of a concurrent snapshot reader.
+              reader = SstableReader.new(ref.path, ref.id)
+              actual = reader.not_nil!.verify
+              table_entries += actual.count
+              unless actual.id == ref.id && actual.first == ref.first &&
+                     actual.last == ref.last && actual.count == ref.count &&
+                     actual.index_count == ref.index_count
+                errors << "#{File.basename(ref.path)}: manifest metadata mismatch"
+              end
+            rescue ex : Exception
+              errors << "#{File.basename(ref.path)}: #{verification_error(ex)}"
+            ensure
+              reader.try(&.close)
+            end
+          end
+
+          wal_files = 0
+          wal_records = 0_i64
+          Dir.children(@path).select { |name| name.ends_with?(WAL_SUFFIX) }.sort.each do |name|
+            wal_files += 1
+            path = File.join(@path, name)
+            bytes_checked += file_size(path)
+            begin
+              wal_records += Wal.verify(path)
+            rescue ex : Exception
+              errors << "#{name}: #{verification_error(ex)}"
+            end
+          end
+
+          VerificationReport.new(table_refs.size.to_i32, table_entries, wal_files,
+            wal_records, bytes_checked, errors)
+        end
       end
     end
 
@@ -343,6 +831,182 @@ module Cinderstore
           @levels.flatten.each(&.close)
         end
       end
+      @commit_group.try(&.shutdown)
+    end
+
+    # ------------------------------------------------------------------
+    # Secondary indexes
+    # ------------------------------------------------------------------
+
+    # Builds the index entries a single write needs.
+    #
+    # The previous live value of the key supplies the old index keys. The
+    # new value supplies the new keys. Removed associations become index
+    # tombstones. Added associations become live entries. A newer entry
+    # supersedes an older one for the same association, so stale entries
+    # drop naturally during compaction.
+    private def maintenance_entries_for(seq : Int64, key : String, new_value : String?) : Array(Entry)
+      return [] of Entry if @indexers.empty?
+      new_keys = new_value ? index_keys_for(key, new_value) : {} of String => Array(String)
+      old_keys = index_keys_for(key, read_live_value(key))
+      index_delta_entries(seq, key, old_keys, new_keys)
+    end
+
+    # Returns the current live value for `key`, or nil. Callers hold the
+    # database lock, so the value is consistent with the write order.
+    private def read_live_value(key : String) : String?
+      if entry = @mem.get_entry(key)
+        return entry.alive ? entry.value : nil
+      end
+      if entry = @frozen.try { |m| m.get_entry(key) }
+        return entry.alive ? entry.value : nil
+      end
+      iter = LiveIter.new(make_merge_iter(key, true))
+      if entry = iter.next?
+        return entry.value if entry.key == key
+      end
+      nil
+    end
+
+    # Returns the index keys every registered index derives from `value`.
+    private def index_keys_for(key : String, value : String?) : Hash(String, Array(String))
+      result = {} of String => Array(String)
+      return result if value.nil?
+      @indexers.each do |name, indexer|
+        indexer.call(key, value).each do |index_key|
+          raise InvalidIndexError.new("index key for #{name} contains a NUL byte") if index_key.includes?(Index::SEP)
+          next if index_key.empty?
+          (result[name] ||= [] of String) << index_key
+        end
+      end
+      result.each { |name, keys| result[name] = keys.uniq }
+      result
+    end
+
+    # Builds the entries that move an association from `old_keys` to
+    # `new_keys`. Added index keys become live entries. Removed index
+    # keys become tombstones. Each entry shares the sequence number of the
+    # primary write, so both land in one write ahead log record.
+    private def index_delta_entries(seq : Int64, key : String,
+                                    old_keys : Hash(String, Array(String)),
+                                    new_keys : Hash(String, Array(String))) : Array(Entry)
+      return [] of Entry if @indexers.empty?
+      raise InvalidKeyError.new("keys with a NUL byte cannot be indexed") if key.includes?(Index::SEP)
+      entries = [] of Entry
+      @indexers.each_key do |name|
+        added = new_keys[name]? || [] of String
+        removed = old_keys[name]? || [] of String
+        (added - removed).each do |index_key|
+          entries << Entry.new(Index.entry_key(name, index_key, key), seq, true, "")
+        end
+        (removed - added).each do |index_key|
+          entries << Entry.new(Index.entry_key(name, index_key, key), seq, false, "")
+        end
+      end
+      entries
+    end
+
+    # Applies index entries to the memtable after a write.
+    private def apply_index_entries(entries : Array(Entry)) : Nil
+      entries.each do |entry|
+        if entry.alive
+          @mem.put(entry.key, "", entry.seq)
+        else
+          @mem.delete(entry.key, entry.seq)
+        end
+      end
+    end
+
+    # Registers an index and backfills associations for existing rows.
+    private def register_index(name : String, indexer : Proc(String, String, Array(String)),
+                               definition : Manifest::IndexInfo? = nil) : Nil
+      validate_index_name(name)
+      wal : Wal::Writer? = nil
+      @lock.synchronize do
+        check_open
+        raise InvalidIndexError.new("index already exists: #{name}") if @indexers.has_key?(name)
+        @indexers[name] = indexer
+        begin
+          wal = backfill_index(name, indexer)
+        rescue ex
+          @indexers.delete(name)
+          raise ex
+        end
+      end
+
+      commit_wal(wal.not_nil!) if wal
+      @lock.synchronize do
+        check_open
+        if info = definition
+          @manifest.not_nil!.indexes << info
+        end
+        save_manifest
+      end
+      trigger_flush
+    end
+
+    # Reconciles one index with the current live primary rows.
+    #
+    # The caller holds the database lock. Missing associations become live
+    # entries. Stale associations become tombstones in one WAL batch.
+    private def backfill_index(name : String, indexer : Proc(String, String, Array(String))) : Wal::Writer?
+      desired = {} of String => Bool
+      collect_range("", nil, -1).each do |key, value|
+        raise InvalidKeyError.new("keys with a NUL byte cannot be indexed") if key.includes?(Index::SEP)
+        indexer.call(key, value).each do |index_key|
+          raise InvalidIndexError.new("index key for #{name} contains a NUL byte") if index_key.includes?(Index::SEP)
+          next if index_key.empty?
+          desired[Index.entry_key(name, index_key, key)] = true
+        end
+      end
+
+      existing = {} of String => Bool
+      prefix = Index.name_prefix(name)
+      iter = make_merge_iter(prefix, false)
+      while entry = iter.next?
+        break unless entry.key.starts_with?(prefix)
+        existing[entry.key] = true if entry.alive
+      end
+
+      pending = [] of Tuple(String, Bool)
+      desired.each_key do |entry_key|
+        pending << {entry_key, true} unless existing.has_key?(entry_key)
+      end
+      existing.each_key do |entry_key|
+        pending << {entry_key, false} unless desired.has_key?(entry_key)
+      end
+      return nil if pending.empty?
+
+      @seq += 1
+      seq = @seq
+      entries = [] of Entry
+      pending.each do |entry_key, alive|
+        entries << Entry.new(entry_key, seq, alive, "")
+      end
+      wal = @wal.not_nil!
+      wal.append_batch(entries)
+      entries.each do |entry|
+        if entry.alive
+          @mem.put(entry.key, entry.value, entry.seq)
+        else
+          @mem.delete(entry.key, entry.seq)
+        end
+      end
+      @writes += 1
+      wal
+    end
+
+    # Extracts keys from one JSON field without failing a write.
+    private def json_index_keys(value : String, field : String) : Array(String)
+      doc = JSON.parse(value)
+      Index.json_field_keys(doc, field)
+    rescue JSON::ParseException
+      [] of String
+    end
+
+    private def validate_index_name(name : String) : Nil
+      raise InvalidIndexError.new("index name must not be empty") if name.empty?
+      raise InvalidIndexError.new("index name contains a NUL byte") if name.includes?(Index::SEP)
     end
 
     # ------------------------------------------------------------------
@@ -356,16 +1020,27 @@ module Cinderstore
       @manifest = manifest
       @seq = manifest.seq
       @next_id = manifest.next_id
+      load_indexers(manifest)
       load_tables(manifest)
       clean_orphans
       recover_wals
       create_active_wal
     end
 
+    # Restores JSON indexers recorded in the manifest.
+    private def load_indexers(manifest : Manifest) : Nil
+      manifest.indexes.each do |definition|
+        validate_index_name(definition.name)
+        raise CorruptDataError.new("persisted index field must not be empty") if definition.field.empty?
+        raise CorruptDataError.new("duplicate persisted index: #{definition.name}") if @indexers.has_key?(definition.name)
+        @indexers[definition.name] = ->(_key : String, value : String) { json_index_keys(value, definition.field) }
+      end
+    end
+
     private def load_tables(manifest : Manifest) : Nil
       @levels = manifest.levels.map do |level|
         level.map do |info|
-          TableRef.new(info.id, info.first, info.last, info.count, table_path(info.id))
+          TableRef.new(info.id, info.first, info.last, info.count, table_path(info.id), info.index_count)
         end
       end
       @levels = [[] of TableRef] if @levels.empty?
@@ -404,7 +1079,7 @@ module Cinderstore
     private def create_active_wal : Nil
       id = @next_id
       @next_id += 1
-      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes)
+      @wal = Wal::Writer.new(wal_path(id), @config.sync_writes, @config.checksums)
     end
 
     # ------------------------------------------------------------------
@@ -459,7 +1134,7 @@ module Cinderstore
           @next_id += 1
           wal_id = @next_id
           @next_id += 1
-          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes)
+          @wal = Wal::Writer.new(wal_path(wal_id), @config.sync_writes, @config.checksums)
         end
       end
 
@@ -468,7 +1143,7 @@ module Cinderstore
       meta = write_memtable_to_table(table_id, frozen)
 
       @lock.synchronize do
-        @levels[0] << TableRef.new(meta.id, meta.first, meta.last, meta.count, table_path(meta.id))
+        @levels[0] << TableRef.new(meta.id, meta.first, meta.last, meta.count, table_path(meta.id), meta.index_count)
         @frozen = nil
         if old = @old_wal
           old.close
@@ -489,7 +1164,7 @@ module Cinderstore
       final_path = table_path(table_id)
       meta = nil
       File.open(tmp_path, "w") do |io|
-        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp)
+        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         mem.each_entry do |entry|
           writer.add(entry.key, entry.value, entry.seq, entry.alive)
         end
@@ -510,6 +1185,17 @@ module Cinderstore
         ensure
           @flushing = false
         end
+      end
+    end
+
+    # Makes the appended record durable.
+    #
+    # With `sync_writes` enabled the commit group batches this call with
+    # concurrent writers, so one fsync covers many records. Without it, no
+    # fsync happens and the call returns immediately.
+    private def commit_wal(wal : Wal::Writer) : Nil
+      if group = @commit_group
+        group.commit(wal)
       end
     end
 
@@ -544,7 +1230,7 @@ module Cinderstore
       outputs = merge_tables(tables.not_nil!, true)
 
       @lock.synchronize do
-        @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }]
+        @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id), m.index_count) }]
         save_manifest
         tables.not_nil!.each do |ref|
           # Mark the table as gone, then drop the database reference. The
@@ -604,7 +1290,7 @@ module Cinderstore
       @lock.synchronize do
         return if @closed
         kept = @levels[target].select { |ref| !overlap.not_nil!.includes?(ref) }
-        @levels[target] = (kept + outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id)) }).sort_by!(&.first)
+        @levels[target] = (kept + outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id), m.index_count) }).sort_by!(&.first)
         @levels[level] = [] of TableRef
         inputs.each do |ref|
           ref.orphan
@@ -649,7 +1335,7 @@ module Cinderstore
             id
           end
           io = File.open(File.join(@path, "#{Util.file_stem(current_id)}#{TMP_SUFFIX}"), "w")
-          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp)
+          writer = SstableWriter.new(io.not_nil!, current_id, @config.block_size, @config.bloom_fpp, @config.checksums)
         end
         writer.not_nil!.add(entry.key, entry.value, entry.seq, entry.alive)
         written += 1
@@ -686,7 +1372,7 @@ module Cinderstore
       manifest.next_id = @next_id
       manifest.levels = @levels.map do |level|
         level.map do |ref|
-          Manifest::TableInfo.new(ref.id, ref.first, ref.last, ref.count)
+          Manifest::TableInfo.new(ref.id, ref.first, ref.last, ref.count, ref.index_count)
         end
       end
       manifest.save(File.join(@path, MANIFEST_NAME))
@@ -703,6 +1389,7 @@ module Cinderstore
     private def validate_key(key : String) : Nil
       raise InvalidKeyError.new("key must not be empty") if key.empty?
       raise InvalidKeyError.new("key exceeds #{MAX_KEY_BYTES} bytes") if key.bytesize > MAX_KEY_BYTES
+      raise InvalidKeyError.new("key starts with the reserved index prefix") if Index.internal_key?(key)
     end
 
     private def check_open : Nil
@@ -710,6 +1397,20 @@ module Cinderstore
     end
 
     private def file_size(path : String) : Int64
+      File.size(path)
+    rescue File::NotFoundError
+      0_i64
+    end
+
+    private def verification_error(error : Exception) : String
+      error.message || error.class.to_s
+    end
+
+    private def self.verification_error(error : Exception) : String
+      error.message || error.class.to_s
+    end
+
+    private def self.verification_file_size(path : String) : Int64
       File.size(path)
     rescue File::NotFoundError
       0_i64

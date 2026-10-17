@@ -1,7 +1,7 @@
 require "socket"
 
 module Cinderstore
-  # A local TCP server that exposes get, put, and delete.
+  # A local TCP server that exposes reads, writes, and maintenance commands.
   #
   # Each client connection runs in its own fiber. Commands are newline
   # terminated. See the README for the full protocol reference.
@@ -59,10 +59,16 @@ module Cinderstore
           next if line.empty?
           begin
             command = parse_command(line)
-            response = execute(command)
             shutdown = true if command.op == "SHUTDOWN"
-            client << response << "\n"
-            client.flush
+            if command.op == "SCAN" || command.op == "SCANPREFIX"
+              stream_scan(client, command)
+            elsif command.op == "QUERY" || command.op == "QUERYRANGE"
+              stream_index_query(client, command)
+            else
+              response = execute(command)
+              client << response << "\n"
+              client.flush
+            end
           rescue ex : Error
             client << "ERR #{ex.message}\n"
             client.flush
@@ -89,10 +95,27 @@ module Cinderstore
         Command.new(op, parts[1], nil, "", nil, -1)
       when "SCAN"
         tokens = line.split(" ")
+        raise ProtocolError.new("too many arguments") if tokens.size > 4
         start = tokens[1]? || ""
         finish = tokens[2]?
-        limit = tokens[3]?.try(&.to_i?) || -1
+        limit = parse_limit(tokens[3]?)
         Command.new(op, "", nil, start, finish, limit)
+      when "SCANPREFIX"
+        tokens = line.split(" ")
+        raise ProtocolError.new("missing prefix") if tokens.size < 2
+        raise ProtocolError.new("too many arguments") if tokens.size > 3
+        Command.new(op, "", nil, tokens[1], nil, parse_limit(tokens[2]?))
+      when "QUERY"
+        raise ProtocolError.new("missing index") if parts.size < 2
+        raise ProtocolError.new("missing index key") if parts.size < 3
+        index_key, limit = parse_query_key_and_limit(parts[2])
+        Command.new(op, parts[1], index_key, "", nil, limit)
+      when "QUERYRANGE"
+        tokens = line.split(" ")
+        raise ProtocolError.new("missing index") if tokens.size < 2
+        raise ProtocolError.new("too many arguments") if tokens.size > 5
+        limit = parse_limit(tokens[4]?)
+        Command.new(op, tokens[1], nil, tokens[2]? || "", tokens[3]?, limit)
       when "STATS", "PING", "FLUSH", "COMPACT", "SHUTDOWN"
         Command.new(op, "", nil, "", nil, -1)
       else
@@ -114,18 +137,6 @@ module Cinderstore
       when "DEL", "DELETE"
         @db.delete(command.key)
         "OK"
-      when "SCAN"
-        rows = @db.scan(command.start, command.finish, command.limit)
-        if rows.empty?
-          "END"
-        else
-          String.build do |s|
-            rows.each do |key, value|
-              s << "ROW #{key} #{value}\n"
-            end
-            s << "END"
-          end
-        end
       when "STATS"
         "STATS #{@db.stats.to_json}"
       when "PING"
@@ -142,6 +153,70 @@ module Cinderstore
       else
         raise ProtocolError.new("unknown command")
       end
+    end
+
+    # Streams a primary-key scan as one ROW line per live pair, then END.
+    # The iterator owns a snapshot, so writes after the command starts do not
+    # change the result. A limit stops the iterator before the next row.
+    private def stream_scan(client : TCPSocket, command : Command) : Nil
+      iter = if command.op == "SCANPREFIX"
+               @db.scan_prefix_iter(command.start, command.limit)
+             else
+               @db.scan_iter(command.start, command.finish, command.limit)
+             end
+      begin
+        while pair = iter.next?
+          client << "ROW #{pair[0]} #{pair[1]}\n"
+          client.flush
+        end
+        client << "END\n"
+        client.flush
+      ensure
+        iter.close
+      end
+    end
+
+    # Streams a query result as one ROW line per primary key, then END.
+    #
+    # The server never materializes the result. Each row is flushed as the
+    # iterator produces it, so a large result keeps a small memory footprint.
+    private def stream_index_query(client : TCPSocket, command : Command) : Nil
+      iter = if command.op == "QUERY"
+               @db.query_iter(command.key, command.value.not_nil!, command.limit)
+             else
+               @db.query_range_iter(command.key, command.start, command.finish, command.limit)
+             end
+      begin
+        while key = iter.next?
+          client << "ROW #{key}\n"
+          client.flush
+        end
+        client << "END\n"
+      ensure
+        iter.close
+      end
+    end
+
+    private def parse_limit(value : String?) : Int32
+      return -1 unless value
+      limit = value.to_i?
+      raise ProtocolError.new("limit must be an integer") unless limit
+      raise ProtocolError.new("limit must not be less than -1") if limit < -1
+      limit
+    end
+
+    # Parses an optional trailing limit without breaking index keys that contain spaces.
+    private def parse_query_key_and_limit(value : String) : Tuple(String, Int32)
+      tokens = value.split(" ")
+      return {value, -1} if tokens.size < 2
+
+      candidate = tokens.last
+      limit = candidate.to_i?
+      return {value, -1} unless limit
+
+      key = tokens[0, tokens.size - 1].join(" ")
+      raise ProtocolError.new("missing index key") if key.empty?
+      {key, parse_limit(candidate)}
     end
   end
 end

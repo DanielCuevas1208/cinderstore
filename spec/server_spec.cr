@@ -27,6 +27,14 @@ private def send_command(sock : TCPSocket, command : String) : String?
   sock.gets
 end
 
+private def receive_rows(sock : TCPSocket) : Array(String)
+  rows = [] of String
+  while (line = sock.gets) && line != "END"
+    rows << line
+  end
+  rows
+end
+
 describe Cinderstore::Server do
   it "serves put, get, and delete over a socket" do
     config = Cinderstore::SpecHelpers.fast_config
@@ -53,13 +61,92 @@ describe Cinderstore::Server do
         send_command(sock, "PUT b two").should eq("OK")
         send_command(sock, "PUT c three").should eq("OK")
 
-        sock << "SCAN a c\n"
+        sock << "SCAN a c 2\n"
         sock.flush
         rows = [] of String
         while (line = sock.gets) && line != "END"
           rows << line
         end
         rows.should eq(["ROW a one", "ROW b two"])
+        sock.close
+      end
+    end
+  end
+
+  it "streams a prefix scan and validates its limit" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("server-prefix", config) do |db, _path|
+      db.put("forge-a", "one")
+      db.put("forge-b", "two")
+      db.put("other", "three")
+      with_server(db) do |server|
+        sock = TCPSocket.new("127.0.0.1", server.port)
+        sock << "SCANPREFIX forge- 1\n"
+        sock.flush
+        rows = [] of String
+        while (line = sock.gets) && line != "END"
+          rows << line
+        end
+        rows.should eq(["ROW forge-a one"])
+
+        sock << "SCANPREFIX forge- 0\n"
+        sock.flush
+        sock.gets.should eq("END")
+
+        sock << "SCANPREFIX forge- nope\n"
+        sock.flush
+        sock.gets.not_nil!.should start_with("ERR limit must be an integer")
+        sock.close
+      end
+    end
+  end
+
+  it "serves queries over a secondary index" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("server-query", config) do |db, _path|
+      db.create_json_index("by-price", "price")
+      with_server(db) do |server|
+        sock = TCPSocket.new("127.0.0.1", server.port)
+        send_command(sock, "PUT a {\"price\":10}").should eq("OK")
+        sock << "QUERY by-price 10\n"
+        sock.flush
+        rows = [] of String
+        while (line = sock.gets) && line != "END"
+          rows << line
+        end
+        rows.should eq(["ROW a"])
+        sock.close
+      end
+    end
+  end
+
+  it "bounds exact and range index queries over a socket" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db("server-query-limits", config) do |db, _path|
+      db.create_index("by-value") { |_key, value| [value] }
+      4.times { |index| db.put("key-#{index}", "same") }
+      db.put("key-spaced", "red ember")
+      with_server(db) do |server|
+        sock = TCPSocket.new("127.0.0.1", server.port)
+
+        sock << "QUERY by-value same 2\n"
+        sock.flush
+        receive_rows(sock).should eq(["ROW key-0", "ROW key-1"])
+
+        sock << "QUERYRANGE by-value same samez 2\n"
+        sock.flush
+        receive_rows(sock).should eq(["ROW key-0", "ROW key-1"])
+
+        sock << "QUERY by-value same 0\n"
+        sock.flush
+        receive_rows(sock).should eq([] of String)
+
+        sock << "QUERY by-value red ember 1\n"
+        sock.flush
+        receive_rows(sock).should eq(["ROW key-spaced"])
+
+        error = send_command(sock, "QUERYRANGE by-value same samez nope")
+        error.not_nil!.should start_with("ERR limit must be an integer")
         sock.close
       end
     end

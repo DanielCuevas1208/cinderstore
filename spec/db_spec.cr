@@ -142,6 +142,65 @@ describe Cinderstore::DB do
     end
   end
 
+  it "round trips a fast-mode database across a restart" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.checksums = false
+    Cinderstore::SpecHelpers.with_db_path("db-fast") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("a", "1")
+      db.put("b", "2")
+      db.flush
+      db.put("c", "3")
+      db.close
+
+      # The reader learns the checksum mode from the files themselves, so
+      # the default config opens the fast-mode directory correctly.
+      reopened = Cinderstore::DB.new(path)
+      reopened.get("a").should eq("1")
+      reopened.get("b").should eq("2")
+      reopened.get("c").should eq("3")
+      reopened.scan.map(&.[0]).should eq(%w[a b c])
+      reopened.close
+    end
+  end
+
+  it "recovers a fast-mode torn write ahead log" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.checksums = false
+    Cinderstore::SpecHelpers.with_db_path("db-fast-torn") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("alpha", "1")
+      db.put("beta", "2")
+      db.put("gamma", "3")
+      db.close
+
+      wal = Dir.children(path).find { |n| n.ends_with?(".wal") }.not_nil!
+      Cinderstore::SpecHelpers.truncate(File.join(path, wal), File.size(File.join(path, wal)) - 3)
+
+      reopened = Cinderstore::DB.new(path, config)
+      reopened.get("alpha").should eq("1")
+      reopened.get("beta").should eq("2")
+      reopened.get("gamma").should be_nil
+      reopened.close
+    end
+  end
+
+  it "compacts fast-mode tables without losing data" do
+    config = Cinderstore::SpecHelpers.fast_config
+    config.checksums = false
+    Cinderstore::SpecHelpers.with_db("db-fast-compact", config) do |db, _path|
+      db.put("k", "v1")
+      db.flush
+      db.put("k", "v2")
+      db.flush
+      db.stats.tables.should eq(2)
+      db.compact
+      db.stats.tables.should eq(1)
+      db.get("k").should eq("v2")
+      db.scan.size.should eq(1)
+    end
+  end
+
   it "recovers the intact prefix of a torn write ahead log" do
     config = Cinderstore::SpecHelpers.fast_config
     Cinderstore::SpecHelpers.with_db_path("db-torn") do |path|
@@ -189,6 +248,21 @@ describe Cinderstore::DB do
       stats.entries.should eq(1)
       stats.seq.should eq(1)
       stats.to_json.should contain("tables")
+    end
+  end
+
+  it "reports the number of writes in stats" do
+    Cinderstore::SpecHelpers.with_db("db-writes") do |db, _path|
+      db.put("a", "1")
+      db.delete("a")
+      db.write do |b|
+        b.put("x", "1")
+        b.put("y", "2")
+      end
+      stats = db.stats
+      stats.writes.should eq(3)
+      stats.to_h.keys.should contain("writes")
+      stats.to_h.keys.should contain("commits")
     end
   end
 

@@ -10,6 +10,7 @@ FileUtils.rm_rf(path) if File.exists?(path)
 config = Cinderstore::DB::Config.new
 config.sync_writes = true
 db = Cinderstore::DB.new(path, config)
+db.create_index("by-material") { |_key, value| [value] }
 server = Cinderstore::Server.new(db, "127.0.0.1", 0)
 
 spawn { server.run }
@@ -30,6 +31,18 @@ puts "GET forge-hammer => #{send(sock, "GET forge-hammer")}"
 puts "GET missing      => #{send(sock, "GET nope")}"
 puts "DEL forge-tongs  => #{send(sock, "DEL forge-tongs")}"
 puts "STATS            => #{send(sock, "STATS")}"
+sock << "SCANPREFIX forge- 1\n"
+sock.flush
+while line = sock.gets
+  puts "SCANPREFIX       => #{line}"
+  break if line == "END"
+end
+sock << "QUERY by-material steel 1\n"
+sock.flush
+while line = sock.gets
+  puts "QUERY            => #{line}"
+  break if line == "END"
+end
 puts "SHUTDOWN         => #{send(sock, "SHUTDOWN")}"
 sock.close
 

@@ -10,6 +10,7 @@ module Cinderstore
     @table : SkipList
     @bytes : Int64 = 0_i64
     @count : Int64 = 0_i64
+    @index_count : Int64 = 0_i64
 
     def initialize(rng : Random = Random.new)
       @table = SkipList.new(rng)
@@ -27,6 +28,11 @@ module Cinderstore
       @bytes
     end
 
+    # Returns how many held entries belong to the internal index namespace.
+    def index_count : Int64
+      @index_count
+    end
+
     # Writes a live value for `key`. Overwrites any previous entry.
     def put(key : String, value : String, seq : Int64) : Nil
       prev = @table.get(key)
@@ -35,6 +41,7 @@ module Cinderstore
       else
         @bytes += key.bytesize + value.bytesize + OVERHEAD
         @count += 1
+        @index_count += 1 if Index.internal_key?(key)
       end
       @table.insert(key, seq, true, value)
     end
@@ -47,6 +54,7 @@ module Cinderstore
       else
         @bytes += key.bytesize + OVERHEAD
         @count += 1
+        @index_count += 1 if Index.internal_key?(key)
       end
       @table.insert(key, seq, false, "")
     end

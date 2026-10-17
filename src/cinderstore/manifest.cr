@@ -7,6 +7,20 @@ module Cinderstore
   # tables grouped by level. It is rewritten atomically through a temp file
   # and a rename.
   class Manifest
+    # A JSON index definition that can be restored after a restart.
+    class IndexInfo
+      include JSON::Serializable
+
+      property name : String = ""
+      property field : String = ""
+
+      def initialize
+      end
+
+      def initialize(@name : String, @field : String)
+      end
+    end
+
     # A table reference as recorded in the manifest.
     class TableInfo
       include JSON::Serializable
@@ -14,11 +28,13 @@ module Cinderstore
       property first : String = ""
       property last : String = ""
       property count : Int64 = 0_i64
+      property index_count : Int64 = 0_i64
 
       def initialize
       end
 
-      def initialize(@id : Int64, @first : String, @last : String, @count : Int64)
+      def initialize(@id : Int64, @first : String, @last : String, @count : Int64,
+                     @index_count : Int64 = 0_i64)
       end
     end
 
@@ -27,6 +43,7 @@ module Cinderstore
     property seq : Int64 = 0_i64
     property next_id : Int64 = 1_i64
     property levels : Array(Array(TableInfo)) = [[] of TableInfo]
+    property indexes : Array(IndexInfo) = [] of IndexInfo
 
     def initialize
     end
