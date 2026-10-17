@@ -63,7 +63,8 @@ describe Cinderstore::DB do
 
       report = Cinderstore::DB.verify(path)
       report.valid?.should be_false
-      report.errors.should contain("000001.sst: manifest metadata mismatch")
+      table_name = "#{Cinderstore::Util.file_stem(manifest.levels[0][0].id)}.sst"
+      report.errors.should contain("#{table_name}: manifest metadata mismatch")
     end
   end
 end

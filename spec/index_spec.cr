@@ -333,8 +333,14 @@ describe Cinderstore::DB do
       db.close
 
       indexed = Cinderstore::DB.new(path, config)
+      expect_raises(Cinderstore::InvalidKeyError) do
+        indexed.create_index("by-value") { |_key, value| [value] }
+      end
+      indexed.put("a\u{0000}b", "w")
+      indexed.get("a\u{0000}b").should eq("w")
+      indexed.delete("a\u{0000}b")
       indexed.create_index("by-value") { |_key, value| [value] }
-      expect_raises(Cinderstore::InvalidKeyError) { indexed.put("a\u{0000}b", "w") }
+      expect_raises(Cinderstore::InvalidKeyError) { indexed.put("a\u{0000}b", "x") }
       indexed.close
     end
   end
