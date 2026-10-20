@@ -124,8 +124,14 @@ module Cinderstore
         level_db.flush
       end
       puts "   after 5 flushes, level counts: #{level_db.stats.level_counts}"
+      before_level_compaction = level_db.stats
       level_db.compact_levels
-      puts "   after compact_levels:          #{level_db.stats.level_counts}"
+      after_level_compaction = level_db.stats
+      puts "   after compact_levels:          #{after_level_compaction.level_counts}"
+      puts "   level bytes before -> after:   #{before_level_compaction.level_bytes} -> #{after_level_compaction.level_bytes}"
+      puts "   compaction tables in -> out:   #{after_level_compaction.compaction_input_tables} -> #{after_level_compaction.compaction_output_tables}"
+      puts "   compaction bytes in -> out:    #{after_level_compaction.compaction_input_bytes} -> #{after_level_compaction.compaction_output_bytes}"
+      puts "   table write amplification:     #{after_level_compaction.write_amplification}x"
       puts "   all #{level_db.scan.size} rows still readable"
       level_db.close
       puts ""

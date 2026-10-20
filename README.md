@@ -17,7 +17,7 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.16.0. It adds bounds to TCP index queries.
+This is release 0.17.0. It adds compaction observability to database statistics.
 All streaming read paths now accept the same limit rules.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
@@ -62,6 +62,7 @@ atomic with the data. Compaction drops stale index entries.
 - Streaming iterators for exact and range index queries
 - Bounded streaming scans and index queries
 - Bounded index queries over the local protocol
+- Compaction telemetry with per-level bytes and write amplification
 - Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
 - Read-only storage verification for tables and write ahead logs
@@ -108,9 +109,10 @@ crystal run examples/server_demo.cr
 The demo loads a product catalog from `fixtures/catalog.csv`. It writes,
 scans, flushes, compacts, deletes, snapshots, and reopens a database. It
 creates indexes after loading data and queries them. The output is deterministic.
+Byte counts change when block or checksum settings change.
 
 ```text
-== Cinderstore 0.16.0 demo ==
+== Cinderstore 0.17.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -160,6 +162,10 @@ Database directory: ...\cinderstore-demo
 9. Leveled compaction keeps each level within its target
    after 5 flushes, level counts: [5]
    after compact_levels:          [0, 0, 1]
+   level bytes before -> after:   [<level-0 bytes>] -> [0, 0, <level-2 bytes>]
+   compaction tables in -> out:   <input tables> -> <output tables>
+   compaction bytes in -> out:    <input bytes> -> <output bytes>
+   table write amplification:     <ratio>x
    all 100 rows still readable
 
 10. Fast mode skips checksums on new writes
@@ -222,8 +228,8 @@ Step 7 shows the value of a snapshot. The live store drops SKU-0001 and adds
 two products. The snapshot still sees the state before those writes.
 
 Step 9 shows the value of leveled compaction. Five flushes create five
-level-0 tables. `compact_levels` merges them into a fresh level-2 table, so
-the store stays tidy as it grows.
+level-0 tables. `compact_levels` merges them into a fresh level-2 table.
+The demo also reports input and output bytes for that work.
 
 Step 10 shows the value of fast mode. It writes the same 72 rows twice. Fast
 mode skips the CRC32 on every log record and every table block. Its log is
@@ -741,6 +747,19 @@ the deepest level, all older copies are gone, so the tombstone can drop.
 The `compact` call merges every level in one pass. The `compact_levels` call
 merges one level at a time. The background task uses `compact_levels`.
 
+`DB#stats` reports current bytes for every level. It also reports cumulative
+compaction input and output tables, entries, and bytes.
+
+`logical_write_bytes` counts primary key and value bytes from `put` and `write`.
+It counts primary key bytes from `delete`. Index entries are excluded.
+
+`flush_bytes_written` counts table bytes created by flushes. `table_bytes_written`
+adds compaction output bytes. `write_amplification` divides that total by
+`logical_write_bytes`. It excludes WAL bytes and returns zero before any user write.
+
+Compaction counters cover completed work during the current database process.
+Reopening the database starts a new counter window.
+
 Compaction keeps a table file on disk while a snapshot references it. The
 file is deleted only after the last snapshot releases it.
 
@@ -904,8 +923,9 @@ spec/                    Test suite
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 209 examples. It covers the
+The suite runs with `crystal spec`. It contains 210 examples. It covers the
 storage layers, recovery, durability, snapshots, indexes, and server protocol.
+The new compaction test reconciles telemetry with produced table files.
 It covers bounded scans, bounded index queries, prefix scans, exports, and verification.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
@@ -949,8 +969,19 @@ Local validation for this release:
 - Custom index blocks are not copied during export.
 - A failed export can leave a partial destination.
 - Verification does not inspect the active in-memory table.
+- Compaction counters reset when a database reopens.
+- Write amplification measures table files. It excludes WAL bytes.
 
 ## Roadmap
+
+In progress:
+
+- Release 0.17: `DB#stats` reports per-level bytes, compaction input and output
+  tables, entries, and bytes. It reports table-file write amplification.
+  Status: implementation and no-codegen checks passed. Executable checks are
+  blocked by the current Windows sandbox.
+  Acceptance: deterministic overwrite and delete tests reconcile counters with
+  the table files on disk. Verification: `crystal spec spec/compaction_spec.cr`.
 
 Complete:
 
@@ -967,9 +998,18 @@ Complete:
 - Release 0.9: streaming primary-key range iterators. A database-level iterator
   owns a snapshot. A snapshot-level iterator borrows its snapshot.
 
-Remaining:
+Planned:
 
-- No later release scope is selected.
+- Compaction budget: bound one compaction call with a configurable work budget.
+  Outcome: operators can limit maintenance work while reads keep the same results.
+  Deliverable: resumable compaction slices with recovery markers.
+  Acceptance: restart between slices preserves values and tombstones.
+  Verification: `crystal spec spec/compaction_budget_spec.cr`.
+- Index build progress: make large index creation inspectable and restartable.
+  Outcome: operators can see progress and query availability during a backfill.
+  Deliverable: bounded index-build batches with persisted progress.
+  Acceptance: restart and concurrent writes match a full primary scan.
+  Verification: `crystal spec spec/index_build_progress_spec.cr`.
 
 Earlier releases:
 

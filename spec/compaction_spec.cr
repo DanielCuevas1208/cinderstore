@@ -32,6 +32,51 @@ describe "Cinderstore compaction" do
     end
   end
 
+  it "reports compaction work and reconciles it with table files" do
+    config = Cinderstore::SpecHelpers.fast_config
+    Cinderstore::SpecHelpers.with_db_path("compact-observability") do |path|
+      db = Cinderstore::DB.new(path, config)
+      db.put("a", "old")
+      db.put("b", "keep")
+      db.flush
+      db.put("a", "new")
+      db.delete("b")
+      db.put("c", "fresh")
+      db.flush
+
+      before_compaction = db.stats
+      input_bytes = Dir.children(path).select(&.ends_with?(".sst")).sum do |name|
+        File.size(File.join(path, name))
+      end
+      before_compaction.level_bytes.sum.should eq(input_bytes)
+
+      db.compact
+
+      stats = db.stats
+      output_bytes = Dir.children(path).select(&.ends_with?(".sst")).sum do |name|
+        File.size(File.join(path, name))
+      end
+      stats.level_counts.should eq([0, 1])
+      stats.level_bytes.should eq([0_i64, output_bytes])
+      stats.disk_bytes.should eq(output_bytes)
+      stats.compaction_input_tables.should eq(2_i64)
+      stats.compaction_input_entries.should eq(5_i64)
+      stats.compaction_input_bytes.should eq(input_bytes)
+      stats.compaction_output_tables.should eq(1_i64)
+      stats.compaction_output_entries.should eq(2_i64)
+      stats.compaction_output_bytes.should eq(output_bytes)
+      stats.flush_bytes_written.should eq(input_bytes)
+      stats.logical_write_bytes.should eq(20_i64)
+      stats.table_bytes_written.should eq(input_bytes + output_bytes)
+      stats.write_amplification.should eq((input_bytes + output_bytes).to_f / 20)
+      stats.to_h["level_bytes"].should eq(stats.level_bytes)
+      stats.to_h["compaction_output_bytes"].should eq(output_bytes)
+      db.scan.map(&.[0]).should eq(%w[a c])
+      db.get("a").should eq("new")
+      db.get("b").should be_nil
+    end
+  end
+
   it "keeps the newest value across tables after compaction" do
     config = Cinderstore::SpecHelpers.fast_config
     Cinderstore::SpecHelpers.with_db("compact-newest", config) do |db, _path|

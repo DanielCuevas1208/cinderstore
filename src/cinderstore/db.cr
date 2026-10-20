@@ -49,6 +49,7 @@ module Cinderstore
       getter l0 : Int32
       getter l1 : Int32
       getter level_counts : Array(Int32)
+      getter level_bytes : Array(Int64)
       getter entries : Int64
       getter disk_bytes : Int64
       getter memtable_bytes : Int64
@@ -58,28 +59,55 @@ module Cinderstore
       getter cache_misses : Int64
       getter writes : Int64
       getter commits : Int64
+      getter logical_write_bytes : Int64
+      getter flush_bytes_written : Int64
+      getter compaction_input_tables : Int64
+      getter compaction_input_entries : Int64
+      getter compaction_input_bytes : Int64
+      getter compaction_output_tables : Int64
+      getter compaction_output_entries : Int64
+      getter compaction_output_bytes : Int64
+      getter table_bytes_written : Int64
+      getter write_amplification : Float64
 
       def initialize(@tables : Int32, @l0 : Int32, @l1 : Int32, @level_counts : Array(Int32),
+                     @level_bytes : Array(Int64),
                      @entries : Int64, @disk_bytes : Int64, @memtable_bytes : Int64,
                      @wal_bytes : Int64, @seq : Int64, @cache_hits : Int64, @cache_misses : Int64,
-                     @writes : Int64, @commits : Int64)
+                     @writes : Int64, @commits : Int64, @logical_write_bytes : Int64,
+                     @flush_bytes_written : Int64, @compaction_input_tables : Int64,
+                     @compaction_input_entries : Int64, @compaction_input_bytes : Int64,
+                     @compaction_output_tables : Int64, @compaction_output_entries : Int64,
+                     @compaction_output_bytes : Int64, @table_bytes_written : Int64,
+                     @write_amplification : Float64)
       end
 
-      def to_h : Hash(String, Int32 | Int64 | Array(Int32))
+      def to_h : Hash(String, Int32 | Int64 | Float64 | Array(Int32) | Array(Int64))
         {
-          "tables"         => @tables,
-          "l0"             => @l0,
-          "l1"             => @l1,
-          "levels"         => @level_counts,
-          "entries"        => @entries,
-          "disk_bytes"     => @disk_bytes,
-          "memtable_bytes" => @memtable_bytes,
-          "wal_bytes"      => @wal_bytes,
-          "seq"            => @seq,
-          "cache_hits"     => @cache_hits,
-          "cache_misses"   => @cache_misses,
-          "writes"         => @writes,
-          "commits"        => @commits,
+          "tables"                    => @tables,
+          "l0"                        => @l0,
+          "l1"                        => @l1,
+          "levels"                    => @level_counts,
+          "level_bytes"               => @level_bytes,
+          "entries"                   => @entries,
+          "disk_bytes"                => @disk_bytes,
+          "memtable_bytes"            => @memtable_bytes,
+          "wal_bytes"                 => @wal_bytes,
+          "seq"                       => @seq,
+          "cache_hits"                => @cache_hits,
+          "cache_misses"              => @cache_misses,
+          "writes"                    => @writes,
+          "commits"                   => @commits,
+          "logical_write_bytes"       => @logical_write_bytes,
+          "flush_bytes_written"       => @flush_bytes_written,
+          "compaction_input_tables"   => @compaction_input_tables,
+          "compaction_input_entries"  => @compaction_input_entries,
+          "compaction_input_bytes"    => @compaction_input_bytes,
+          "compaction_output_tables"  => @compaction_output_tables,
+          "compaction_output_entries" => @compaction_output_entries,
+          "compaction_output_bytes"   => @compaction_output_bytes,
+          "table_bytes_written"       => @table_bytes_written,
+          "write_amplification"       => @write_amplification,
         }
       end
 
@@ -90,13 +118,20 @@ module Cinderstore
       def to_s(io : IO) : Nil
         io << "tables: #{@tables} (l0: #{@l0}, l1: #{@l1})\n"
         io << "levels: #{@level_counts}\n"
+        io << "level bytes: #{@level_bytes}\n"
         io << "entries: #{@entries}\n"
         io << "disk bytes: #{@disk_bytes}\n"
         io << "memtable bytes: #{@memtable_bytes}\n"
         io << "wal bytes: #{@wal_bytes}\n"
         io << "sequence: #{@seq}\n"
         io << "cache hits: #{@cache_hits}, misses: #{@cache_misses}\n"
-        io << "writes: #{@writes}, commits: #{@commits}"
+        io << "writes: #{@writes}, commits: #{@commits}\n"
+        io << "logical write bytes: #{@logical_write_bytes}\n"
+        io << "flush bytes written: #{@flush_bytes_written}\n"
+        io << "compaction input: #{@compaction_input_tables} tables, #{@compaction_input_entries} entries, #{@compaction_input_bytes} bytes\n"
+        io << "compaction output: #{@compaction_output_tables} tables, #{@compaction_output_entries} entries, #{@compaction_output_bytes} bytes\n"
+        io << "table bytes written: #{@table_bytes_written}\n"
+        io << "write amplification: #{@write_amplification}"
       end
     end
 
@@ -223,6 +258,14 @@ module Cinderstore
     @pending_table_id : Int64 = 0_i64
     @manifest : Manifest? = nil
     @writes : Int64 = 0_i64
+    @logical_write_bytes : Int64 = 0_i64
+    @flush_bytes_written : Int64 = 0_i64
+    @compaction_input_tables : Int64 = 0_i64
+    @compaction_input_entries : Int64 = 0_i64
+    @compaction_input_bytes : Int64 = 0_i64
+    @compaction_output_tables : Int64 = 0_i64
+    @compaction_output_entries : Int64 = 0_i64
+    @compaction_output_bytes : Int64 = 0_i64
     @commit_group : CommitGroup? = nil
     @indexers : Hash(String, Proc(String, String, Array(String)))
 
@@ -386,6 +429,7 @@ module Cinderstore
         @mem.put(key, value, seq)
         apply_index_entries(entries)
         @writes += 1
+        @logical_write_bytes += logical_write_bytes(key, value, true)
       end
       commit_wal(wal.not_nil!)
       trigger_flush
@@ -410,6 +454,7 @@ module Cinderstore
         @mem.delete(key, seq)
         apply_index_entries(entries)
         @writes += 1
+        @logical_write_bytes += logical_write_bytes(key, "", false)
       end
       commit_wal(wal.not_nil!)
       trigger_flush
@@ -461,6 +506,9 @@ module Cinderstore
           end
         end
         @writes += 1
+        ops.each do |key, value, alive|
+          @logical_write_bytes += logical_write_bytes(key, value, alive)
+        end
       end
       commit_wal(wal.not_nil!)
       trigger_flush
@@ -665,7 +713,8 @@ module Cinderstore
       @lock.synchronize do
         check_open
         table_refs = @levels.flatten
-        disk_bytes = table_refs.sum { |ref| file_size(ref.path) }
+        level_bytes = @levels.map { |level| level.sum { |ref| file_size(ref.path) } }
+        disk_bytes = level_bytes.sum
         entries = table_refs.sum { |ref| ref.count - ref.index_count } +
                   (@mem.size - @mem.index_count) +
                   (@frozen.try { |m| m.size - m.index_count } || 0_i64)
@@ -678,6 +727,7 @@ module Cinderstore
           l0: @levels[0].size,
           l1: @levels.size > 1 ? @levels[1].size : 0,
           level_counts: @levels.map(&.size),
+          level_bytes: level_bytes,
           entries: entries,
           disk_bytes: disk_bytes,
           memtable_bytes: @mem.approximate_bytes,
@@ -687,6 +737,16 @@ module Cinderstore
           cache_misses: @block_cache.misses,
           writes: @writes,
           commits: @commit_group.try(&.commits) || 0_i64,
+          logical_write_bytes: @logical_write_bytes,
+          flush_bytes_written: @flush_bytes_written,
+          compaction_input_tables: @compaction_input_tables,
+          compaction_input_entries: @compaction_input_entries,
+          compaction_input_bytes: @compaction_input_bytes,
+          compaction_output_tables: @compaction_output_tables,
+          compaction_output_entries: @compaction_output_entries,
+          compaction_output_bytes: @compaction_output_bytes,
+          table_bytes_written: @flush_bytes_written + @compaction_output_bytes,
+          write_amplification: write_amplification,
         )
       end
     end
@@ -1144,6 +1204,7 @@ module Cinderstore
 
       @lock.synchronize do
         @levels[0] << TableRef.new(meta.id, meta.first, meta.last, meta.count, table_path(meta.id), meta.index_count)
+        @flush_bytes_written += file_size(table_path(meta.id))
         @frozen = nil
         if old = @old_wal
           old.close
@@ -1230,6 +1291,7 @@ module Cinderstore
       outputs = merge_tables(tables.not_nil!, true)
 
       @lock.synchronize do
+        record_compaction(tables.not_nil!, outputs)
         @levels = [[] of TableRef, outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id), m.index_count) }]
         save_manifest
         tables.not_nil!.each do |ref|
@@ -1289,6 +1351,7 @@ module Cinderstore
 
       @lock.synchronize do
         return if @closed
+        record_compaction(inputs, outputs)
         kept = @levels[target].select { |ref| !overlap.not_nil!.includes?(ref) }
         @levels[target] = (kept + outputs.map { |m| TableRef.new(m.id, m.first, m.last, m.count, table_path(m.id), m.index_count) }).sort_by!(&.first)
         @levels[level] = [] of TableRef
@@ -1345,6 +1408,16 @@ module Cinderstore
       outputs
     end
 
+    # Records completed compaction work while input files still exist.
+    private def record_compaction(inputs : Array(TableRef), outputs : Array(TableMeta)) : Nil
+      @compaction_input_tables += inputs.size
+      @compaction_input_entries += inputs.sum(&.count)
+      @compaction_input_bytes += inputs.sum { |ref| file_size(ref.path) }
+      @compaction_output_tables += outputs.size
+      @compaction_output_entries += outputs.sum(&.count)
+      @compaction_output_bytes += outputs.sum { |meta| file_size(table_path(meta.id)) }
+    end
+
     # Returns true when every level below `level` holds no tables.
     private def no_data_below?(level : Int32) : Bool
       ((level + 1)...@levels.size).all? { |l| @levels[l].empty? }
@@ -1360,6 +1433,17 @@ module Cinderstore
     private def level_target(level : Int32) : Int64
       scale = @config.level_ratio ** level
       (@config.memtable_limit * scale).to_i64
+    end
+
+    # Returns bytes in table files written per logical primary write byte.
+    private def write_amplification : Float64
+      return 0.0 if @logical_write_bytes == 0
+      (@flush_bytes_written + @compaction_output_bytes).to_f / @logical_write_bytes
+    end
+
+    # Counts primary key and value bytes for one user write.
+    private def logical_write_bytes(key : String, value : String, alive : Bool) : Int64
+      key.bytesize.to_i64 + (alive ? value.bytesize.to_i64 : 0_i64)
     end
 
     # ------------------------------------------------------------------
