@@ -17,7 +17,7 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.17.0. It adds compaction observability to database statistics.
+This is release 0.18.0. It adds resumable compaction slices with recovery markers.
 All streaming read paths now accept the same limit rules.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
@@ -63,6 +63,7 @@ atomic with the data. Compaction drops stale index entries.
 - Bounded streaming scans and index queries
 - Bounded index queries over the local protocol
 - Compaction telemetry with per-level bytes and write amplification
+- Budgeted full compaction slices with restart recovery
 - Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
 - Read-only storage verification for tables and write ahead logs
@@ -112,7 +113,7 @@ creates indexes after loading data and queries them. The output is deterministic
 Byte counts change when block or checksum settings change.
 
 ```text
-== Cinderstore 0.17.0 demo ==
+== Cinderstore 0.18.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -167,6 +168,9 @@ Database directory: ...\cinderstore-demo
    compaction bytes in -> out:    <input bytes> -> <output bytes>
    table write amplification:     <ratio>x
    all 100 rows still readable
+   budgeted compaction resumes after restart
+   restart slices: 4, rows after compaction: 5
+   deleted budget-01: nil
 
 10. Fast mode skips checksums on new writes
    checksummed: wal 5231 bytes, disk 5692 bytes
@@ -230,6 +234,7 @@ two products. The snapshot still sees the state before those writes.
 Step 9 shows the value of leveled compaction. Five flushes create five
 level-0 tables. `compact_levels` merges them into a fresh level-2 table.
 The demo also reports input and output bytes for that work.
+It then resumes a budgeted merge after several restarts.
 
 Step 10 shows the value of fast mode. It writes the same 72 rows twice. Fast
 mode skips the CRC32 on every log record and every table block. Its log is
@@ -763,6 +768,13 @@ Reopening the database starts a new counter window.
 Compaction keeps a table file on disk while a snapshot references it. The
 file is deleted only after the last snapshot releases it.
 
+Set `Config#compaction_work_budget` to a positive key count to bound one
+full `compact` call. Each call writes complete output tables and stores a
+resume key in the manifest. A restart resumes the marker. Source tables stay
+live until the final slice swaps the output into level 1. A value of zero
+keeps the original one-pass behavior. `compact_levels` keeps its level-aware
+behavior unless it resumes an existing budgeted full compaction.
+
 ### Wire reads
 
 Each scan command opens one database iterator. The iterator owns one snapshot.
@@ -916,17 +928,18 @@ src/cli.cr               Command line tool
 examples/demo.cr         Library walkthrough
 examples/server_demo.cr  Wire protocol walkthrough
 fixtures/catalog.csv     Sample product catalog
+ROADMAP.md               Milestone status and verification commands
 spec/export_spec.cr      Export and flush regression tests
+spec/compaction_budget_spec.cr  Restartable compaction tests
 spec/limits_spec.cr      Bounded iterator regression tests
 spec/                    Test suite
 ```
 
 ## Test status
 
-The suite runs with `crystal spec`. It contains 210 examples. It covers the
-storage layers, recovery, durability, snapshots, indexes, and server protocol.
-The new compaction test reconciles telemetry with produced table files.
-It covers bounded scans, bounded index queries, prefix scans, exports, and verification.
+The suite runs with `crystal spec`. It covers storage, recovery, durability,
+snapshots, indexes, and the server protocol. The compaction tests cover
+telemetry reconciliation and restartable budgeted merges.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -934,7 +947,7 @@ formatting, runs the suite, runs both demos, and builds the binary.
 Local validation for this release:
 
 - Formatting passed with `crystal tool format --check`.
-- No-codegen type checks passed for the CLI, demos, and all 23 spec files.
+- No-codegen type checks passed for the CLI, both demos, and all spec files.
 - Full executable specs and production builds remain blocked by Windows sandbox restrictions.
 - Crystal cannot create compiler cache files or MSVC process pipes here.
 
@@ -956,6 +969,8 @@ Local validation for this release:
 - Indexers must be deterministic. The same value must give the same keys.
 - `compact_levels` merges a whole level at once. A very large level makes a
   large merge. The level targets keep that merge rare.
+- `compaction_work_budget` applies to full `compact` calls. Level-aware
+  compaction remains whole-level work.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
 - A non-negative iterator limit bounds returned rows without materializing the rest.
@@ -974,61 +989,8 @@ Local validation for this release:
 
 ## Roadmap
 
-In progress:
-
-- Release 0.17: `DB#stats` reports per-level bytes, compaction input and output
-  tables, entries, and bytes. It reports table-file write amplification.
-  Status: implementation and no-codegen checks passed. Executable checks are
-  blocked by the current Windows sandbox.
-  Acceptance: deterministic overwrite and delete tests reconcile counters with
-  the table files on disk. Verification: `crystal spec spec/compaction_spec.cr`.
-
-Complete:
-
-- Release 0.16: bounded exact and range index queries work over the local protocol.
-- Release 0.15: bounded limits apply to primary scans and index queries, including snapshots and CLI reads.
-- Release 0.14: index creation backfills existing rows. JSON definitions survive restart and export.
-- Release 0.13: consistent snapshot export to a new database directory.
-- Release 0.12: streaming primary-key range and prefix scans over the local
-  protocol. Limits stop iterators before the next row.
-- Release 0.11: read-only storage verification. The check covers tables, WALs,
-  and manifest metadata without repairing files.
-- Release 0.10: primary-key prefix scans. Materialized scans and streaming
-  iterators use one ordered merge path. Snapshot iterators borrow snapshots.
-- Release 0.9: streaming primary-key range iterators. A database-level iterator
-  owns a snapshot. A snapshot-level iterator borrows its snapshot.
-
-Planned:
-
-- Compaction budget: bound one compaction call with a configurable work budget.
-  Outcome: operators can limit maintenance work while reads keep the same results.
-  Deliverable: resumable compaction slices with recovery markers.
-  Acceptance: restart between slices preserves values and tombstones.
-  Verification: `crystal spec spec/compaction_budget_spec.cr`.
-- Index build progress: make large index creation inspectable and restartable.
-  Outcome: operators can see progress and query availability during a backfill.
-  Deliverable: bounded index-build batches with persisted progress.
-  Acceptance: restart and concurrent writes match a full primary scan.
-  Verification: `crystal spec spec/index_build_progress_spec.cr`.
-
-Earlier releases:
-
-- Release 0.8: streaming iterators for secondary index queries. A query
-  iterator reads a snapshot and yields primary keys one at a time. The
-  server streams query results over the socket.
-- Release 0.7: secondary indexes. Index entries share the log structured
-  merge tree. The store maintains each index on every write. Queries return
-  the primary keys behind an index key.
-- Release 0.6: batch writes and group commit. A batch is one atomic write
-  ahead log record. Concurrent writers share one durability sync per group.
-- Release 0.5: optional checksum-free fast mode. New data can skip CRC32
-  checksums. The on-disk format records the mode, so old and new files mix
-  safely.
-- Release 0.4: level-based compaction. Tables cascade from level 0 to deeper
-  levels. Each level stays within its size target. Tombstones survive until
-  the deepest level.
-- Release 0.3: snapshot iterators and consistent reads. Snapshots give a
-  stable view of the store. Compaction keeps referenced files alive.
+See [ROADMAP.md](ROADMAP.md) for milestone status, acceptance criteria, and
+verification commands.
 
 ## License
 

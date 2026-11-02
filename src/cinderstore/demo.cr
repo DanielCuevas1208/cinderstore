@@ -136,6 +136,36 @@ module Cinderstore
       level_db.close
       puts ""
 
+      puts "   budgeted compaction resumes after restart"
+      budget_path = File.join(Dir.tempdir, "cinderstore-budget-demo")
+      FileUtils.rm_rf(budget_path) if File.exists?(budget_path)
+      budget_config = DB::Config.new
+      budget_config.sync_writes = false
+      budget_config.compact_on_flush = false
+      budget_config.checksums = @checksums
+      budget_config.compaction_work_budget = 2
+      budget_db = DB.new(budget_path, budget_config)
+      4.times { |i| budget_db.put("budget-%02d" % i, "old") }
+      budget_db.flush
+      budget_db.delete("budget-01")
+      budget_db.put("budget-04", "fresh")
+      budget_db.put("budget-05", "fresh")
+      budget_db.flush
+      budget_db.compact
+      budget_slices = 1
+      budget_db.close
+      loop do
+        budget_db = DB.new(budget_path, budget_config)
+        break unless budget_db.compaction_pending?
+        budget_db.compact
+        budget_slices += 1
+        budget_db.close
+      end
+      puts "   restart slices: #{budget_slices}, rows after compaction: #{budget_db.scan.size}"
+      puts "   deleted budget-01: #{budget_db.get("budget-01").inspect}"
+      budget_db.close
+      puts ""
+
       puts "10. Fast mode skips checksums on new writes"
       checked_path = File.join(Dir.tempdir, "cinderstore-checked-demo")
       fast_path = File.join(Dir.tempdir, "cinderstore-fast-demo")

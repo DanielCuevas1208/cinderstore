@@ -41,6 +41,9 @@ module Cinderstore
       # Size ratio between levels. Level L may hold up to `level_ratio`
       # times the data of level L - 1. A higher ratio runs less often.
       property level_ratio : Float64 = 10.0
+      # Maximum number of merged keys processed by one resumable full
+      # compaction slice. Zero disables the budget.
+      property compaction_work_budget : Int32 = 0
     end
 
     # A snapshot of database counters for reporting.
@@ -266,6 +269,7 @@ module Cinderstore
     @compaction_output_tables : Int64 = 0_i64
     @compaction_output_entries : Int64 = 0_i64
     @compaction_output_bytes : Int64 = 0_i64
+    @compaction_job : Manifest::CompactionInfo? = nil
     @commit_group : CommitGroup? = nil
     @indexers : Hash(String, Proc(String, String, Array(String)))
 
@@ -621,6 +625,12 @@ module Cinderstore
       end
     end
 
+    # Returns true while a budgeted full compaction has unfinished slices.
+    # The marker survives a database restart.
+    def compaction_pending? : Bool
+      @lock.synchronize { !@compaction_job.nil? }
+    end
+
     # Runs level-by-level compaction until every level is within its target.
     #
     # Level 0 merges into level 1 when it holds enough tables. Deeper levels
@@ -628,6 +638,14 @@ module Cinderstore
     # true when any table moved. The automatic background task uses this.
     def compact_levels : Bool
       @flush_lock.synchronize do
+        pending = @lock.synchronize do
+          return false if @closed
+          !@compaction_job.nil?
+        end
+        if pending
+          do_compact
+          return true
+        end
         moved = false
         loop do
           level = @lock.synchronize do
@@ -1080,6 +1098,7 @@ module Cinderstore
       @manifest = manifest
       @seq = manifest.seq
       @next_id = manifest.next_id
+      @compaction_job = manifest.compaction
       load_indexers(manifest)
       load_tables(manifest)
       clean_orphans
@@ -1108,6 +1127,9 @@ module Cinderstore
 
     private def clean_orphans : Nil
       known = @levels.flatten.map(&.id)
+      if job = @manifest.try(&.compaction)
+        known.concat(job.output_ids)
+      end
       Dir.children(@path).each do |name|
         if name.ends_with?(SST_SUFFIX)
           id = name.rpartition(".")[0].to_i64
@@ -1236,6 +1258,32 @@ module Cinderstore
       meta.not_nil!
     end
 
+    # Writes a completed output slice before its manifest marker advances.
+    private def write_entries_to_table(table_id : Int64, entries : Array(Entry)) : TableMeta
+      tmp_path = File.join(@path, "#{Util.file_stem(table_id)}#{TMP_SUFFIX}")
+      final_path = table_path(table_id)
+      meta = nil
+      File.open(tmp_path, "w") do |io|
+        writer = SstableWriter.new(io, table_id, @config.block_size, @config.bloom_fpp, @config.checksums)
+        entries.each { |entry| writer.add(entry.key, entry.value, entry.seq, entry.alive) }
+        meta = writer.finish
+        io.flush
+        io.fsync if @config.sync_writes
+      end
+      File.rename(tmp_path, final_path)
+      meta.not_nil!
+    end
+
+    # Reserves a table id before writing a resumable output file.
+    private def allocate_compaction_table_id : Int64
+      @lock.synchronize do
+        id = @next_id
+        @next_id += 1
+        save_manifest
+        id
+      end
+    end
+
     private def trigger_flush : Nil
       return if @mem.approximate_bytes < @config.memtable_limit
       return if @flushing
@@ -1280,7 +1328,141 @@ module Cinderstore
     # ------------------------------------------------------------------
 
     # Merges every table into a fresh, non-overlapping level-1 set.
+    # A positive budget persists the merge between calls and restarts.
     private def do_compact : Nil
+      pending = @lock.synchronize { !@compaction_job.nil? }
+      if pending || @config.compaction_work_budget > 0
+        do_compact_slice(@config.compaction_work_budget)
+      else
+        do_full_compact
+      end
+    end
+
+    # Runs one resumable compaction slice. Source tables stay in the manifest
+    # until the final slice swaps the completed output into the live levels.
+    private def do_compact_slice(work_budget : Int32) : Nil
+      job : Manifest::CompactionInfo? = nil
+      inputs : Array(TableRef)? = nil
+      @lock.synchronize do
+        return if @closed
+        job = @compaction_job
+        unless job
+          tables = @levels.flatten
+          return if tables.size < 2
+          job = Manifest::CompactionInfo.new(tables.map(&.id))
+          @compaction_job = job
+          @manifest.not_nil!.compaction = job
+          save_manifest
+        end
+        inputs = compaction_inputs(job.not_nil!)
+      end
+
+      current_job = job.not_nil!
+      current_inputs = inputs.not_nil!
+      if current_job.finished
+        @lock.synchronize do
+          current = @compaction_job
+          finalize_compaction(current.not_nil!, compaction_inputs(current.not_nil!)) if current
+        end
+        return
+      end
+
+      entries, last_key, finished = merge_compaction_slice(current_inputs, current_job.last_key, work_budget)
+      output : TableMeta? = nil
+      unless entries.empty?
+        table_id = allocate_compaction_table_id
+        output = write_entries_to_table(table_id, entries)
+      end
+
+      @lock.synchronize do
+        current = @compaction_job
+        raise CorruptDataError.new("compaction marker changed during compaction") unless current
+        current.output_ids << output.not_nil!.id if output
+        current.last_key = last_key
+        current.finished = finished
+        save_manifest
+        finalize_compaction(current, compaction_inputs(current)) if current.finished
+      end
+    end
+
+    # Returns the input references named by a durable compaction marker.
+    # The caller holds the database lock.
+    private def compaction_inputs(job : Manifest::CompactionInfo) : Array(TableRef)
+      refs = @levels.flatten
+      job.input_ids.map do |id|
+        ref = refs.find { |candidate| candidate.id == id }
+        raise CorruptDataError.new("compaction input table is missing: #{id}") unless ref
+        ref
+      end
+    end
+
+    # Produces one ordered output slice and returns its resume key.
+    private def merge_compaction_slice(tables : Array(TableRef), last_key : String,
+                                       work_budget : Int32) : Tuple(Array(Entry), String, Bool)
+      readers = @lock.synchronize { tables.map { |ref| ref.reader(@block_cache) } }
+      sources = [] of Store::Iter
+      readers.each { |reader| sources << TableIter.new(reader) }
+      iter = MergeIter.new(sources)
+      iter.seek(last_key) unless last_key.empty?
+
+      entries = [] of Entry
+      processed = 0
+      resume_key = last_key
+      while entry = iter.next?
+        next if !last_key.empty? && entry.key <= last_key
+        processed += 1
+        resume_key = entry.key
+        entries << entry if entry.alive
+        if work_budget > 0 && processed >= work_budget
+          return {entries, resume_key, false}
+        end
+      end
+      {entries, resume_key, true}
+    end
+
+    # Finishes a marker whose output files are already complete. The caller
+    # holds the database lock.
+    private def finalize_compaction(job : Manifest::CompactionInfo, inputs : Array(TableRef)) : Nil
+      outputs = job.output_ids.map do |id|
+        reader = SstableReader.new(table_path(id), id)
+        begin
+          reader.verify
+        ensure
+          reader.close
+        end
+      end
+      output_refs = outputs.map do |meta|
+        TableRef.new(meta.id, meta.first, meta.last, meta.count, table_path(meta.id), meta.index_count)
+      end
+
+      kept_levels = [[] of TableRef, [] of TableRef]
+      input_ids = job.input_ids
+      @levels.each_with_index do |level, level_index|
+        level.each do |ref|
+          next if input_ids.includes?(ref.id)
+          target_level = level_index == 0 ? 0 : 1
+          kept_levels[target_level] << ref
+        end
+      end
+      kept_levels[1].concat(output_refs)
+      kept_levels[1].sort_by!(&.first)
+      @levels = kept_levels
+
+      record_compaction(inputs, outputs)
+      @compaction_job = nil
+      @manifest.not_nil!.compaction = nil
+      save_manifest
+
+      inputs.each do |ref|
+        # Mark the table as gone, then drop the database reference. The file
+        # stays on disk until every snapshot reference is released.
+        ref.orphan
+        ref.release
+      end
+    end
+
+    # The original one-pass compaction path for an unlimited budget.
+    private def do_full_compact : Nil
       tables = nil
       @lock.synchronize do
         return if @closed

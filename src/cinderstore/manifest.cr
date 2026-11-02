@@ -38,12 +38,29 @@ module Cinderstore
       end
     end
 
+    # Durable state for a resumable full compaction.
+    class CompactionInfo
+      include JSON::Serializable
+
+      property input_ids : Array(Int64) = [] of Int64
+      property output_ids : Array(Int64) = [] of Int64
+      property last_key : String = ""
+      property finished : Bool = false
+
+      def initialize
+      end
+
+      def initialize(@input_ids : Array(Int64))
+      end
+    end
+
     include JSON::Serializable
 
     property seq : Int64 = 0_i64
     property next_id : Int64 = 1_i64
     property levels : Array(Array(TableInfo)) = [[] of TableInfo]
     property indexes : Array(IndexInfo) = [] of IndexInfo
+    property compaction : CompactionInfo? = nil
 
     def initialize
     end
