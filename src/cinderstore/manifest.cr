@@ -7,17 +7,30 @@ module Cinderstore
   # tables grouped by level. It is rewritten atomically through a temp file
   # and a rename.
   class Manifest
+    # Durable progress for a resumable JSON index build.
+    class IndexBuildInfo
+      include JSON::Serializable
+
+      property processed : Int64 = 0_i64
+      property last_key : String = ""
+      property complete : Bool = false
+
+      def initialize
+      end
+    end
+
     # A JSON index definition that can be restored after a restart.
     class IndexInfo
       include JSON::Serializable
 
       property name : String = ""
       property field : String = ""
+      property build : IndexBuildInfo? = nil
 
       def initialize
       end
 
-      def initialize(@name : String, @field : String)
+      def initialize(@name : String, @field : String, @build : IndexBuildInfo? = nil)
       end
     end
 

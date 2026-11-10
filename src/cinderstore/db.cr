@@ -44,6 +44,41 @@ module Cinderstore
       # Maximum number of merged keys processed by one resumable full
       # compaction slice. Zero disables the budget.
       property compaction_work_budget : Int32 = 0
+      # Maximum number of primary rows processed by one index build slice.
+      property index_build_batch_size : Int32 = 256
+    end
+
+    # Inspectable state for one JSON index build.
+    class IndexBuildStatus
+      getter name : String
+      getter state : String
+      getter processed : Int64
+      getter last_key : String
+
+      def initialize(@name : String, @state : String, @processed : Int64, @last_key : String)
+      end
+
+      def ready? : Bool
+        @state == "ready"
+      end
+
+      def to_h : Hash(String, String | Int64 | Bool)
+        {
+          "name"      => @name,
+          "state"     => @state,
+          "processed" => @processed,
+          "last_key"  => @last_key,
+          "ready"     => ready?,
+        }
+      end
+
+      def to_json(io : IO) : Nil
+        to_h.to_json(io)
+      end
+
+      def to_s(io : IO) : Nil
+        io << "index #{@name}: #{@state}, processed #{@processed}, last key #{@last_key.inspect}"
+      end
     end
 
     # A snapshot of database counters for reporting.
@@ -272,14 +307,20 @@ module Cinderstore
     @compaction_job : Manifest::CompactionInfo? = nil
     @commit_group : CommitGroup? = nil
     @indexers : Hash(String, Proc(String, String, Array(String)))
+    @index_build_lock = Mutex.new
+    @index_builds : Hash(String, Manifest::IndexBuildInfo)
+    @index_statuses : Hash(String, IndexBuildStatus)
 
     def initialize(path : String, config : Config = Config.new)
+      raise ArgumentError.new("index_build_batch_size must be positive") if config.index_build_batch_size <= 0
       @path = path
       @config = config
       @mem = MemTable.new
       @levels = [[] of TableRef]
       @block_cache = BlockCache.new(config.cache_blocks)
       @indexers = {} of String => Proc(String, String, Array(String))
+      @index_builds = {} of String => Manifest::IndexBuildInfo
+      @index_statuses = {} of String => IndexBuildStatus
       open
       @commit_group = CommitGroup.new if config.sync_writes
     end
@@ -310,6 +351,72 @@ module Cinderstore
       register_index(name, indexer, Manifest::IndexInfo.new(name, field))
     end
 
+    # Starts a durable, resumable JSON index build.
+    # The index accepts writes, but queries wait until the build is ready.
+    def start_json_index(name : String, field : String) : IndexBuildStatus
+      raise InvalidIndexError.new("field must not be empty") if field.empty?
+      indexer = ->(_key : String, value : String) { json_index_keys(value, field) }
+      build = Manifest::IndexBuildInfo.new
+      register_index(name, indexer, Manifest::IndexInfo.new(name, field, build))
+      index_build_status(name).not_nil!
+    end
+
+    # Advances one configured batch of a JSON index build.
+    # Call this method again until the returned status is ready.
+    def build_index(name : String) : IndexBuildStatus
+      validate_index_name(name)
+      @index_build_lock.synchronize do
+        wal : Wal::Writer? = nil
+        status : IndexBuildStatus? = nil
+        @lock.synchronize do
+          check_open
+          build = @index_builds[name]?
+          unless build
+            status = @index_statuses[name]?
+            raise InvalidIndexError.new("index is not building: #{name}") unless status
+            next
+          end
+
+          indexer = @indexers[name]?.not_nil!
+          entries, last_key, processed, finished = build_index_batch(name, build.last_key, indexer)
+          unless entries.empty?
+            @seq += 1
+            entries = entries.map { |entry| Entry.new(entry.key, @seq, true, entry.value) }
+            wal = @wal.not_nil!
+            wal.append_batch(entries)
+            apply_index_entries(entries)
+            @writes += 1
+          end
+
+          build.last_key = last_key
+          build.processed += processed
+          build.complete = finished
+          status = index_build_status_for(name, build)
+        end
+
+        commit_wal(wal.not_nil!) if wal
+        @lock.synchronize do
+          if build = @index_builds[name]?
+            update_index_manifest(name, build)
+            if build.complete
+              @index_builds.delete(name)
+            end
+            status = @index_statuses[name] = index_build_status_for(name, build)
+          end
+        end
+        status.not_nil!
+      end
+    end
+
+    # Returns the persisted build state, or nil for an untracked index.
+    def index_build_status(name : String) : IndexBuildStatus?
+      validate_index_name(name)
+      @lock.synchronize do
+        check_open
+        @index_statuses[name]?
+      end
+    end
+
     # Returns true when `name` is a registered index.
     def index?(name : String) : Bool
       @lock.synchronize { @indexers.has_key?(name) }
@@ -329,6 +436,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_open
+        ensure_index_ready(index)
         return [] of String if limit == 0
         prefix = Index.exact_prefix(index, index_key)
         keys = [] of String
@@ -353,6 +461,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_open
+        ensure_index_ready(index)
         return [] of String if limit == 0
         prefix = Index.name_prefix(index)
         start = "#{prefix}#{start_key}#{Index::SEP}"
@@ -380,6 +489,10 @@ module Cinderstore
     # are done; that releases the snapshot.
     def query_iter(index : String, index_key : String, limit : Int32 = -1) : IndexIter
       validate_index_name(index)
+      @lock.synchronize do
+        check_open
+        ensure_index_ready(index)
+      end
       snap = snapshot
       begin
         iter = snap.query_iter(index, index_key, limit)
@@ -402,6 +515,10 @@ module Cinderstore
     def query_range_iter(index : String, start_key : String = "", finish_key : String? = nil,
                          limit : Int32 = -1) : IndexIter
       validate_index_name(index)
+      @lock.synchronize do
+        check_open
+        ensure_index_ready(index)
+      end
       snap = snapshot
       begin
         iter = snap.query_range_iter(index, start_key, finish_key, limit)
@@ -670,7 +787,7 @@ module Cinderstore
       @lock.synchronize do
         check_open
         tables = @levels.map { |level| level.dup }
-        Snapshot.new(@seq, @mem.dup, @frozen, tables, @config.cache_blocks)
+        Snapshot.new(@seq, @mem.dup, @frozen, tables, @config.cache_blocks, @index_builds.keys)
       end
     end
 
@@ -1005,9 +1122,22 @@ module Cinderstore
         raise InvalidIndexError.new("index already exists: #{name}") if @indexers.has_key?(name)
         @indexers[name] = indexer
         begin
-          wal = backfill_index(name, indexer)
+          if info = definition
+            if build = info.build
+              @index_builds[name] = build
+              @index_statuses[name] = index_build_status_for(name, build)
+            else
+              wal = backfill_index(name, indexer)
+              @index_statuses[name] = IndexBuildStatus.new(name, "ready", -1_i64, "")
+            end
+          else
+            wal = backfill_index(name, indexer)
+            @index_statuses[name] = IndexBuildStatus.new(name, "ready", -1_i64, "")
+          end
         rescue ex
           @indexers.delete(name)
+          @index_builds.delete(name)
+          @index_statuses.delete(name)
           raise ex
         end
       end
@@ -1021,6 +1151,51 @@ module Cinderstore
         save_manifest
       end
       trigger_flush
+    end
+
+    # Collects one bounded batch of live primary rows.
+    # The caller holds the database lock.
+    private def build_index_batch(name : String, last_key : String,
+                                  indexer : Proc(String, String, Array(String))) : Tuple(Array(Entry), String, Int64, Bool)
+      iter = LiveIter.new(make_merge_iter(last_key, false))
+      entries = [] of Entry
+      cursor = last_key
+      processed = 0_i64
+      finished = true
+      while entry = iter.next?
+        next if !last_key.empty? && entry.key <= last_key
+        raise InvalidKeyError.new("keys with a NUL byte cannot be indexed") if entry.key.includes?(Index::SEP)
+        indexer.call(entry.key, entry.value).uniq.each do |index_key|
+          raise InvalidIndexError.new("index key contains a NUL byte") if index_key.includes?(Index::SEP)
+          next if index_key.empty?
+          entries << Entry.new(Index.entry_key(name, index_key, entry.key), 0_i64, true, "")
+        end
+        cursor = entry.key
+        processed += 1
+        if processed >= @config.index_build_batch_size
+          finished = false
+          break
+        end
+      end
+      {entries, cursor, processed, finished}
+    end
+
+    private def index_build_status_for(name : String, build : Manifest::IndexBuildInfo) : IndexBuildStatus
+      state = build.complete ? "ready" : "building"
+      IndexBuildStatus.new(name, state, build.processed, build.last_key)
+    end
+
+    private def update_index_manifest(name : String, build : Manifest::IndexBuildInfo) : Nil
+      definition = @manifest.not_nil!.indexes.find { |info| info.name == name }
+      raise CorruptDataError.new("index definition is missing: #{name}") unless definition
+      definition.not_nil!.build = build
+      save_manifest
+    end
+
+    private def ensure_index_ready(name : String) : Nil
+      if status = @index_statuses[name]?
+        raise IndexNotReadyError.new("index is still building: #{name}") unless status.ready?
+      end
     end
 
     # Reconciles one index with the current live primary rows.
@@ -1113,6 +1288,12 @@ module Cinderstore
         raise CorruptDataError.new("persisted index field must not be empty") if definition.field.empty?
         raise CorruptDataError.new("duplicate persisted index: #{definition.name}") if @indexers.has_key?(definition.name)
         @indexers[definition.name] = ->(_key : String, value : String) { json_index_keys(value, definition.field) }
+        if build = definition.build
+          @index_statuses[definition.name] = index_build_status_for(definition.name, build)
+          @index_builds[definition.name] = build unless build.complete
+        else
+          @index_statuses[definition.name] = IndexBuildStatus.new(definition.name, "ready", -1_i64, "")
+        end
       end
     end
 

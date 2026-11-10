@@ -30,4 +30,8 @@ module Cinderstore
   # Raised when a secondary index definition or index key is invalid.
   class InvalidIndexError < Error
   end
+
+  # Raised when a query targets an index that is still building.
+  class IndexNotReadyError < Error
+  end
 end
