@@ -14,7 +14,8 @@ module Cinderstore
     @readers = {} of DB::TableRef => SstableReader
 
     def initialize(@seq : Int64, @mem : MemTable, @frozen : MemTable?,
-                   @tables : Array(Array(DB::TableRef)), cache_blocks : Int32)
+                   @tables : Array(Array(DB::TableRef)), cache_blocks : Int32,
+                   @building_indexes : Array(String) = [] of String)
       @block_cache = BlockCache.new(cache_blocks)
       @tables.flatten.each(&.retain)
     end
@@ -112,6 +113,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_released
+        ensure_index_ready(index)
         return [] of String if limit == 0
         prefix = Index.exact_prefix(index, index_key)
         keys = [] of String
@@ -136,6 +138,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_released
+        ensure_index_ready(index)
         return [] of String if limit == 0
         prefix = Index.name_prefix(index)
         start = "#{prefix}#{start_key}#{Index::SEP}"
@@ -176,6 +179,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_released
+        ensure_index_ready(index)
         prefix = Index.exact_prefix(index, index_key)
         IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(prefix, false)), prefix, nil, false, limit)
       end
@@ -194,6 +198,7 @@ module Cinderstore
       validate_index_name(index)
       @lock.synchronize do
         check_released
+        ensure_index_ready(index)
         prefix = Index.name_prefix(index)
         start = "#{prefix}#{start_key}#{Index::SEP}"
         IndexIter.new(self, SnapshotIter.new(self, make_merge_iter(start, false)), prefix, finish_key, false, limit)
@@ -266,6 +271,12 @@ module Cinderstore
     private def validate_index_name(name : String) : Nil
       raise InvalidIndexError.new("index name must not be empty") if name.empty?
       raise InvalidIndexError.new("index name contains a NUL byte") if name.includes?(Index::SEP)
+    end
+
+    private def ensure_index_ready(name : String) : Nil
+      if @building_indexes.includes?(name)
+        raise IndexNotReadyError.new("index is still building: #{name}")
+      end
     end
 
     private def check_released : Nil

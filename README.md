@@ -17,7 +17,7 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.18.0. It adds resumable compaction slices with recovery markers.
+This is release 0.19.0. It adds resumable JSON index builds with recovery markers.
 All streaming read paths now accept the same limit rules.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
@@ -64,6 +64,8 @@ atomic with the data. Compaction drops stale index entries.
 - Bounded index queries over the local protocol
 - Compaction telemetry with per-level bytes and write amplification
 - Budgeted full compaction slices with restart recovery
+- Resumable JSON index builds with persisted progress
+- Query gating until an index build is ready
 - Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
 - Read-only storage verification for tables and write ahead logs
@@ -113,7 +115,7 @@ creates indexes after loading data and queries them. The output is deterministic
 Byte counts change when block or checksum settings change.
 
 ```text
-== Cinderstore 0.18.0 demo ==
+== Cinderstore 0.19.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -186,7 +188,8 @@ Database directory: ...\cinderstore-demo
    all 200 rows recovered after a restart
 
 12. Secondary indexes track derived views
-   created and backfilled indexes on name, price, and stock
+   built by-name index in 3 batches (24 rows)
+   created and backfilled indexes on price and stock
    query by-name "Ash Rake Forged"  => SKU-0010
    query by-price "14.0"            => SKU-0010
    query by-stock "31"              => SKU-0010
@@ -247,8 +250,9 @@ They write 200 rows with 25 syncs instead of 200. The store still recovers
 every row after a restart.
 
 Step 12 shows the value of secondary indexes. Three JSON indexes cover the
-catalog. Creation backfills the existing rows. A price update moves SKU-0010
-between index keys. The store recovers index maintenance after a restart.
+catalog. The name index builds in bounded batches. Queries wait until the
+build is ready. A price update moves SKU-0010 between index keys. The store
+recovers index maintenance after a restart.
 
 Step 13 shows the value of streaming iterators. An exact query streams its
 matches one at a time. A range query stops early after three rows. A
@@ -460,6 +464,23 @@ key between index keys. A delete removes the key from every index.
 
 Index creation scans existing primary rows. JSON index definitions persist in
 the manifest and restore maintenance after a restart.
+
+Build a JSON index in bounded batches when backfill must yield between calls.
+
+```crystal
+config = Cinderstore::DB::Config.new
+config.index_build_batch_size = 100
+db = Cinderstore::DB.new("data/catalog", config)
+status = db.start_json_index("by-name", "name")
+until status.ready?
+  status = db.build_index("by-name")
+  puts status
+end
+```
+
+The build stores its cursor in `MANIFEST`. New writes update the index during
+the build. Queries raise `IndexNotReadyError` until `ready?` returns true.
+Reopen the database and call `build_index` to resume an unfinished build.
 
 Find the primary keys behind one index key.
 
@@ -895,6 +916,7 @@ config.l0_compact_threshold = 4
 config.compact_on_flush = true
 config.max_levels = 7
 config.level_ratio = 10.0
+config.index_build_batch_size = 256
 db = Cinderstore::DB.new("data", config)
 ```
 
@@ -910,6 +932,9 @@ carry checksums. Use fast mode for ephemeral data or data you can rebuild.
 `sync_writes` controls durability. When it is `true`, writers share commit
 groups and wait for one shared fsync. A single sequential writer still syncs
 once per write. When it is `false`, writes never fsync and return at once.
+
+`index_build_batch_size` bounds primary rows processed by one `build_index`
+call. A larger value reduces calls and holds the database lock longer.
 
 ## Project layout
 
@@ -931,6 +956,7 @@ fixtures/catalog.csv     Sample product catalog
 ROADMAP.md               Milestone status and verification commands
 spec/export_spec.cr      Export and flush regression tests
 spec/compaction_budget_spec.cr  Restartable compaction tests
+spec/index_build_progress_spec.cr  Resumable index build tests
 spec/limits_spec.cr      Bounded iterator regression tests
 spec/                    Test suite
 ```
@@ -938,8 +964,8 @@ spec/                    Test suite
 ## Test status
 
 The suite runs with `crystal spec`. It covers storage, recovery, durability,
-snapshots, indexes, and the server protocol. The compaction tests cover
-telemetry reconciliation and restartable budgeted merges.
+snapshots, indexes, and the server protocol. Index build tests cover persisted
+cursors, query gating, restarts, and concurrent writes.
 
 The CI workflow runs on GitHub Actions for Windows and Ubuntu. It checks
 formatting, runs the suite, runs both demos, and builds the binary.
@@ -948,8 +974,8 @@ Local validation for this release:
 
 - Formatting passed with `crystal tool format --check`.
 - No-codegen type checks passed for the CLI, both demos, and all spec files.
-- Full executable specs and production builds remain blocked by Windows sandbox restrictions.
-- Crystal cannot create compiler cache files or MSVC process pipes here.
+- Executable specs and production builds remain blocked by Windows sandbox restrictions.
+- Crystal cannot create MSVC process pipes in this environment.
 
 ## Limitations
 
@@ -971,6 +997,9 @@ Local validation for this release:
   large merge. The level targets keep that merge rare.
 - `compaction_work_budget` applies to full `compact` calls. Level-aware
   compaction remains whole-level work.
+- `start_json_index` builds one configured batch per `build_index` call.
+- Queries reject an index until its build reports `ready`.
+- A large index build holds the database lock for each batch.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.
 - A non-negative iterator limit bounds returned rows without materializing the rest.

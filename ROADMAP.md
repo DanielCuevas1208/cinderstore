@@ -2,9 +2,9 @@
 
 Statuses use `complete`, `in progress`, `planned`, or `blocked`.
 
-## In progress
+## Complete
 
-### compaction-budget — in progress
+### compaction-budget — complete
 
 User-visible outcome: operators can limit maintenance work between calls.
 
@@ -22,15 +22,10 @@ Verification command: `crystal spec spec/compaction_budget_spec.cr`.
 
 Evidence in this release:
 
-- No-codegen type checks pass for the CLI, both demos, and all spec files.
-- `crystal tool format --check` passes.
+- GitHub Actions [run 36](https://github.com/DanielCuevas1208/cinderstore/actions/runs/41429567155) passed on Ubuntu and Windows.
+- The run checks formatting, the full spec suite, both demos, and the production build.
 - The deterministic spec covers restarts, updates, and tombstones.
 - The demo reports restart slices and a deleted key.
-
-Verification blocker: the Windows sandbox denies Crystal linker pipes and
-cache writes. The executable spec run remains pending in this environment.
-
-## Complete
 
 ### compaction-observability — complete
 
@@ -99,17 +94,49 @@ Level-based compaction cascades tables and retains tombstones at deeper levels.
 
 Snapshots and snapshot iterators provide consistent reads during compaction.
 
-## Planned
+## In progress
 
-### index-build-progress — planned
+### index-build-progress — in progress
 
-User-visible outcome: operators can inspect index backfill progress.
+User-visible outcome: operators can inspect and resume JSON index backfills.
 
-Bounded deliverable: persisted batches with explicit query availability rules.
+Bounded deliverable: persisted primary-key cursors with one configurable batch per call.
 
-Acceptance: restart and concurrent writes match a full primary scan.
+Acceptance criteria:
+
+- `start_json_index` persists a building status and a primary-key cursor.
+- `build_index` processes at most `index_build_batch_size` live primary rows.
+- Queries and snapshot queries reject incomplete indexes.
+- Restart resumes the stored cursor.
+- Concurrent writes remain indexed and finished results match a primary scan.
 
 Verification command: `crystal spec spec/index_build_progress_spec.cr`.
+
+Evidence in this release:
+
+- `crystal tool format --check` passes.
+- No-codegen type checks pass for the CLI, both demos, and all spec files.
+- The deterministic spec covers query gating, restart recovery, and writes between slices.
+- The demo includes a three-batch catalog walkthrough and matching README output.
+
+Verification blocker: the Windows sandbox denies Crystal linker pipes.
+The executable spec run remains pending in this environment.
+
+## Planned
+
+### index-build-cli — planned
+
+User-visible outcome: operators can resume and inspect index builds without embedding Crystal code.
+
+Bounded deliverable: CLI commands for index status and one JSON index build batch.
+
+Acceptance criteria:
+
+- Status prints name, state, processed rows, and last key.
+- Build runs one configured batch and returns a non-ready exit code when work remains.
+- Restart and query-gating behavior match the library API.
+
+Verification command: `crystal spec spec/index_build_cli_spec.cr`.
 
 ### level-compaction-budget — planned
 
