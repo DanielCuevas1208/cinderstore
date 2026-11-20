@@ -17,8 +17,8 @@ Secondary indexes map derived keys to primary keys. The store keeps each
 index in sync with every write. Query an index to find the primary keys
 behind one value.
 
-This is release 0.19.0. It adds resumable JSON index builds with recovery markers.
-All streaming read paths now accept the same limit rules.
+This is release 0.20.0. It adds CLI commands for JSON index build progress.
+Operators can inspect status, run one batch, and resume after a restart.
 
 Release 0.10 added prefix scans. A prefix scan returns live key/value pairs
 whose keys start with the prefix bytes.
@@ -65,6 +65,7 @@ atomic with the data. Compaction drops stale index entries.
 - Compaction telemetry with per-level bytes and write amplification
 - Budgeted full compaction slices with restart recovery
 - Resumable JSON index builds with persisted progress
+- CLI commands for index start, status, and build batches
 - Query gating until an index build is ready
 - Consistent snapshot export to a new database directory
 - Crash recovery from the write ahead log
@@ -115,7 +116,7 @@ creates indexes after loading data and queries them. The output is deterministic
 Byte counts change when block or checksum settings change.
 
 ```text
-== Cinderstore 0.19.0 demo ==
+== Cinderstore 0.20.0 demo ==
 
 Loaded 24 products from ...\fixtures\catalog.csv
 Database directory: ...\cinderstore-demo
@@ -633,6 +634,25 @@ Query a secondary index.
 bin/cinderstore query --index by-price --key 14.0
 ```
 
+Start a resumable JSON index build.
+
+```console
+bin/cinderstore index-start --index by-name --field name --batch-size 100
+```
+
+Show persisted build progress as one JSON line.
+
+```console
+bin/cinderstore index-status --index by-name
+```
+
+Run one build batch. Exit code 2 means the index is still building.
+
+```console
+bin/cinderstore index-build --index by-name --batch-size 100
+echo $?
+```
+
 Query an index range.
 
 ```console
@@ -949,7 +969,8 @@ src/cinderstore/scan_iter.cr    Streaming primary-key range and prefix iterators
 src/cinderstore/util.cr    Prefix range upper bounds
 src/cinderstore/snapshot.cr  Point-in-time snapshot support
 src/cinderstore/manifest.cr  Durable tables and JSON index definitions
-src/cli.cr               Command line tool
+src/cli.cr               Command line entry point
+src/cinderstore/cli.cr   Command line tool
 examples/demo.cr         Library walkthrough
 examples/server_demo.cr  Wire protocol walkthrough
 fixtures/catalog.csv     Sample product catalog
@@ -957,6 +978,7 @@ ROADMAP.md               Milestone status and verification commands
 spec/export_spec.cr      Export and flush regression tests
 spec/compaction_budget_spec.cr  Restartable compaction tests
 spec/index_build_progress_spec.cr  Resumable index build tests
+spec/index_build_cli_spec.cr  Index build CLI tests
 spec/limits_spec.cr      Bounded iterator regression tests
 spec/                    Test suite
 ```
@@ -973,9 +995,8 @@ formatting, runs the suite, runs both demos, and builds the binary.
 Local validation for this release:
 
 - Formatting passed with `crystal tool format --check`.
-- No-codegen type checks passed for the CLI, both demos, and all spec files.
-- Executable specs and production builds remain blocked by Windows sandbox restrictions.
-- Crystal cannot create MSVC process pipes in this environment.
+- `crystal spec` passed on Windows with 216 examples.
+- `shards build --production` passed on Windows.
 
 ## Limitations
 
@@ -999,6 +1020,8 @@ Local validation for this release:
   compaction remains whole-level work.
 - `start_json_index` builds one configured batch per `build_index` call.
 - Queries reject an index until its build reports `ready`.
+- Index build CLI commands return exit code 2 while work remains.
+- `query` returns exit code 2 when the target index is still building.
 - A large index build holds the database lock for each batch.
 - No multi-threaded runtime is required. The server uses fibers.
 - Release snapshots before you close the database.

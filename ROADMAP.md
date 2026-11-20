@@ -38,6 +38,46 @@ produced table files.
 
 Verification command: `crystal spec spec/compaction_spec.cr`.
 
+### index-build-progress — complete
+
+User-visible outcome: operators can inspect and resume JSON index backfills.
+
+Bounded deliverable: persisted primary-key cursors with one configurable batch per call.
+
+Acceptance criteria:
+
+- `start_json_index` persists a building status and a primary-key cursor.
+- `build_index` processes at most `index_build_batch_size` live primary rows.
+- Queries and snapshot queries reject incomplete indexes.
+- Restart resumes the stored cursor.
+- Concurrent writes remain indexed and finished results match a primary scan.
+
+Verification command: `crystal spec spec/index_build_progress_spec.cr`.
+
+Evidence in this release:
+
+- Local `crystal spec spec/index_build_progress_spec.cr` passed on Windows.
+- GitHub Actions CI run 42800891603 passed on Ubuntu and Windows for release 0.19.0.
+
+### index-build-cli — complete
+
+User-visible outcome: operators can resume and inspect index builds without embedding Crystal code.
+
+Bounded deliverable: CLI commands for index status and one JSON index build batch.
+
+Acceptance criteria:
+
+- Status prints name, state, processed rows, and last key.
+- Build runs one configured batch and returns a non-ready exit code when work remains.
+- Restart and query-gating behavior match the library API.
+
+Verification command: `crystal spec spec/index_build_cli_spec.cr`.
+
+Evidence in this release:
+
+- Local `crystal spec spec/index_build_cli_spec.cr` passed on Windows after a production CLI build.
+- `query` returns exit code 2 while an index is still building.
+
 ### release-0.16 — complete
 
 Bounded exact and range index queries work over the local protocol.
@@ -94,49 +134,7 @@ Level-based compaction cascades tables and retains tombstones at deeper levels.
 
 Snapshots and snapshot iterators provide consistent reads during compaction.
 
-## In progress
-
-### index-build-progress — in progress
-
-User-visible outcome: operators can inspect and resume JSON index backfills.
-
-Bounded deliverable: persisted primary-key cursors with one configurable batch per call.
-
-Acceptance criteria:
-
-- `start_json_index` persists a building status and a primary-key cursor.
-- `build_index` processes at most `index_build_batch_size` live primary rows.
-- Queries and snapshot queries reject incomplete indexes.
-- Restart resumes the stored cursor.
-- Concurrent writes remain indexed and finished results match a primary scan.
-
-Verification command: `crystal spec spec/index_build_progress_spec.cr`.
-
-Evidence in this release:
-
-- `crystal tool format --check` passes.
-- No-codegen type checks pass for the CLI, both demos, and all spec files.
-- The deterministic spec covers query gating, restart recovery, and writes between slices.
-- The demo includes a three-batch catalog walkthrough and matching README output.
-
-Verification blocker: the Windows sandbox denies Crystal linker pipes.
-The executable spec run remains pending in this environment.
-
 ## Planned
-
-### index-build-cli — planned
-
-User-visible outcome: operators can resume and inspect index builds without embedding Crystal code.
-
-Bounded deliverable: CLI commands for index status and one JSON index build batch.
-
-Acceptance criteria:
-
-- Status prints name, state, processed rows, and last key.
-- Build runs one configured batch and returns a non-ready exit code when work remains.
-- Restart and query-gating behavior match the library API.
-
-Verification command: `crystal spec spec/index_build_cli_spec.cr`.
 
 ### level-compaction-budget — planned
 
@@ -147,3 +145,17 @@ Bounded deliverable: apply persisted work budgets to `compact_levels`.
 Acceptance: restart preserves level placement, values, and tombstones.
 
 Verification command: `crystal spec spec/level_compaction_budget_spec.cr`.
+
+### wire-index-build — planned
+
+User-visible outcome: remote operators can start and resume JSON index builds over the socket protocol.
+
+Bounded deliverable: `INDEXSTART`, `INDEXSTATUS`, and `INDEXBUILD` wire commands with the same gating rules as the library.
+
+Acceptance criteria:
+
+- Each command prints one JSON status line or an `ERR` response.
+- `INDEXBUILD` returns a non-zero wire error code while work remains.
+- Restart and concurrent-write behavior match the CLI and library paths.
+
+Verification command: `crystal spec spec/wire_index_build_spec.cr`.
